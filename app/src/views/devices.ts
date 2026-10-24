@@ -1,4 +1,5 @@
 import { api, type DeviceInfo, type WirelessDevice } from "../api";
+import { deviceAlias, identifyDevice, renameDevice } from "../device-actions";
 import { h } from "../dom";
 import { icon } from "../icons";
 import { edit, store } from "../store";
@@ -40,6 +41,7 @@ export function devices(): View {
   let busy: string | null = null;
   let lastKey = "";
   let introDone = false;
+  const identifying = new Set<string>();
 
   const root = h(
     "div",
@@ -59,6 +61,7 @@ export function devices(): View {
       h(
         "div",
         { class: "list" },
+        row("设备名字", "名字只存在这台电脑上，按设备 MAC 记住；换位置或换机箱槽位都不影响。改名不向设备发送。"),
         row("锁定绑定", "只控制现在这些设备，新绑定的不自动加入、离线的不自动清理。只在电脑这边生效，不向设备发命令", lock),
         row("无线频道", "附近有多套联力无线设备、或者和 Wi-Fi 互相干扰时换一个。本机绑定的设备会一起切过去，有设备没跟上会自动切回原频道", channelSelect),
       ),
@@ -107,7 +110,7 @@ export function devices(): View {
   function draw() {
     const st = store.status;
     const locked = store.config?.devices.locked ?? [];
-    const key = JSON.stringify([st?.wireless, st?.devices, st?.transmitter, st?.mb_pwm_percent != null, locked, busy, store.offline != null]);
+    const key = JSON.stringify([st?.wireless, st?.devices, st?.transmitter, st?.mb_pwm_percent != null, st?.ring88, store.config?.ring88.enabled, locked, busy, store.offline != null, [...identifying], store.config?.devices.aliases]);
     if (key === lastKey) return; // 内容没变就不重建，免得打断点击
     lastKey = key;
 
@@ -145,10 +148,18 @@ export function devices(): View {
       }
     }
     for (const w of wireless.filter((x) => x.owner === "ours" && !isCooler(x.kind))) {
-      const name = w.fan_count ? `UNI FAN ${w.kind} ×${w.fan_count}` : w.kind;
-      cards.push(card("fan", "var(--c-fan)", name, w.address, { text: w.excluded ? "不受控" : "无线", on: !w.excluded }, [["接收槽位", `rx ${w.rx} · 频道 ${w.channel}`]], footFor(w, name, true, locked)));
+      const model = w.fan_count ? `UNI FAN ${w.kind} ×${w.fan_count}` : w.kind;
+      const name = deviceAlias(w.address, store.config?.devices.aliases) || model;
+      cards.push(card("fan", "var(--c-fan)", name, w.address, { text: w.excluded ? "不受控" : "无线", on: !w.excluded }, [["型号", model], ["接收槽位", `rx ${w.rx} · 频道 ${w.channel}`]], footFor(w, name, true, locked)));
     }
-    mine.replaceChildren(...(cards.length ? cards : [h("p", { class: "muted" }, store.offline ? "后台服务没有运行。" : "没有找到设备。")]));
+    if (store.config?.ring88) {
+      const enabled = store.config.ring88.enabled;
+      const displayPresent=st?.ring88?.display_present===true;
+      const ringPresent=st?.ring88?.present===true;
+      const ringConnected=st?.ring88?.connected===true;
+      cards.push(card("ring88", "var(--c-gpu)", "Universal Screen 8.8", "8.8 屏幕与灯环 USB 独立检测 · 画面由 Libre Panel 管理", { text: displayPresent?"屏幕已识别":ringPresent?"灯环已识别":"未检测到", on: displayPresent || ringPresent }, [["屏幕USB 1CBE:A088",displayPresent?"已识别（不认领）":"未检测到"],["灯环USB 0416:8050",ringPresent?(enabled?(ringConnected?"控制中":"接管重试中") : "已识别·未接管"):(st?.ring88?.error??"未检测到")]], h("a", { class: "btn btn-sm btn-soft", href: "#/lighting" }, "灯效…")));
+    }
+    mine.replaceChildren(...(cards.length ? cards : [h("p", { class: "muted" }, store.offline ? "后台服务没有运行。" : "没有找到设备。") ]));
     // 第一次拿到设备数据时卡片依次浮现；之后内容变化重建卡片不再播放。
     if (!introDone && st) {
       introDone = true;
@@ -178,7 +189,35 @@ export function devices(): View {
   function footFor(w: WirelessDevice, name: string, withSync: boolean, locked: string[]) {
     const unbindBtn = h("button", { type: "button", class: "btn btn-sm btn-danger", disabled: busy != null }, busy === w.address ? "处理中…" : "解绑…");
     unbindBtn.addEventListener("click", () => unbind(w, name));
-    const left = h("div", { style: "display: flex; flex-wrap: wrap; gap: 4px 16px" });
+    const renameBtn = h("button", { type: "button", class: "btn btn-sm btn-ghost" }, icon("rename"), "命名…");
+    renameBtn.addEventListener("click", async () => {
+      const ok = await renameDevice(w.address, deviceAlias(w.address, store.config?.devices.aliases), name);
+      if (ok) draw();
+    });
+    // 识别只给后台确认支持单独控制的 TL 风扇组（supports_control === true）；冷头无线模块没有 FanGroup，不提供入口。
+    const fanGroup = store.status?.fan_groups.find((g) => g.address === w.address);
+    let identifyBtn: HTMLButtonElement | null = null;
+    if (fanGroup?.supports_control === true) {
+      const identifiable = w.owner === "ours";
+      identifyBtn = h("button", { type: "button", class: "btn btn-sm btn-ghost" }, icon("locate"), "识别");
+      identifyBtn.disabled = !identifiable || identifying.has(w.address);
+      identifyBtn.title = identifiable ? "让这台组闪灯" : "只能识别本机绑定的设备";
+      identifyBtn.lastChild!.textContent = identifying.has(w.address) ? "识别中…" : "识别";
+      identifyBtn.addEventListener("click", async () => {
+        if (!identifiable || identifying.has(w.address)) return;
+        identifying.add(w.address);
+        draw();
+        try {
+          await identifyDevice(w.address, name);
+        } finally {
+          window.setTimeout(() => {
+            identifying.delete(w.address);
+            draw();
+          }, 3000);
+        }
+      });
+    }
+    const left = h("div", { style: "display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center" });
     if (withSync) {
       const sync = toggle(`${name} 主板灯光同步`, (on) => run(on ? "开启主板灯光同步" : "关闭主板灯光同步", w.address, () => api.setMbLightSync(w.address, on)));
       sync.checked = w.mb_light_sync;
@@ -195,6 +234,8 @@ export function devices(): View {
       ctl.checked = !w.excluded;
       left.append(h("label", { class: "inline-switch small" }, ctl, "受控"));
     }
+    left.append(renameBtn);
+    if (identifyBtn) left.append(identifyBtn);
     return h("div", { class: "device-foot" }, left, unbindBtn);
   }
 

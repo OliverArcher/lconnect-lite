@@ -4,16 +4,17 @@ import { icon } from "./icons";
 import { startPolling, store, subscribe } from "./store";
 import { cooling } from "./views/cooling";
 import { devices } from "./views/devices";
+import { fans } from "./views/fans";
 import { lighting } from "./views/lighting";
 import { overview } from "./views/overview";
 import { screen } from "./views/screen";
 import { settings } from "./views/settings";
 import type { View } from "./views/view";
 
-const routes: Record<string, () => View> = { overview, cooling, lighting, screen, devices, settings };
+const routes: Record<string, () => View> = { overview, cooling, fans, lighting, screen, devices, settings };
 const NAV: [string, [string, string][]][] = [
   ["监控", [["overview", "概览"]]],
-  ["控制", [["cooling", "散热"], ["lighting", "灯效"], ["screen", "冷头屏幕"]]],
+  ["控制", [["cooling", "水冷"], ["fans", "风扇"], ["lighting", "灯效"], ["screen", "冷头屏幕"]]],
   ["系统", [["devices", "设备"], ["settings", "设置"]]],
 ];
 

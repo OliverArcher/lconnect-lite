@@ -12,8 +12,10 @@ mod color;
 #[allow(dead_code)]
 mod effects;
 pub mod h2;
+pub mod ring88;
 pub mod tl;
 pub mod types;
 
 pub use animation::{Animation, SecondaryTiming};
+pub use ring88::{render as render_ring88, supported_parameters as ring88_parameters};
 pub use types::{RgbDirection, RgbEffect, RgbMode, RgbScope};

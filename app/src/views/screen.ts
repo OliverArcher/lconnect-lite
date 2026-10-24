@@ -189,7 +189,22 @@ export function screen(): View {
   const root = h(
     "div",
     { class: "page" },
-    h("header", { class: "page-head" }, h("div", { class: "page-title" }, h("h1", {}, "冷头屏幕"), h("span", { class: "subtitle" }, "480 × 480 · 改动立即推送到屏幕"))),
+    h("header", { class: "page-head" }, h("div", { class: "page-title" }, h("h1", {}, "冷头屏幕"), h("span", { class: "subtitle" }, "480 × 480 · 改动立即推送到屏幕；8.8 寸屏的画面由 Libre Panel 负责"))),
+    h(
+      "div",
+      { class: "banner banner-info" },
+      icon("alert"),
+      h(
+        "div",
+        { class: "banner-text" },
+        h("b", {}, "冷头画面由单独的 lcl-display-host 进程提供"),
+        h(
+          "span",
+          {},
+          "内容渲染已经不在后台服务里：需要单独启动 lcl-display-host，它通过命名管道把 JPEG 交给后台服务，再由服务独占 H2 的 USB 句柄推屏。这个界面不会自动启动它，没启动时屏幕画面不会更新。8.8 寸屏的画面仍由 Libre Panel 管理。",
+        ),
+      ),
+    ),
     h(
       "section",
       { class: "row-grid", style: "align-items: flex-start" },

@@ -20,8 +20,13 @@ pub enum Request {
     SetAutostart { enabled: bool },
     /// 各类设备支持的灯效和每种效果可调的参数。
     GetLightingCaps,
+    GetGroupLightingCaps { address: String },
+    IdentifyDevice { address: String },
+    RenameDevice { address: String, name: String },
     /// 屏幕当前在显示什么，以及最近一帧画面（JPEG，base64）。
     GetLcdState,
+    /// Latest-only mailbox for the independent H2 content host. No 8.8 transport.
+    SubmitLcdFrame { jpeg: Vec<u8> },
     /// 把无线设备绑定到本机发射器 / 解绑。由控制线程执行，最多等 15 秒。
     Bind { address: String },
     Unbind { address: String },

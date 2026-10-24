@@ -19,7 +19,12 @@ const PATHS: Record<string, string> = {
   upload: '<path d="M12 15V4M7 9l5-5 5 5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
   pump: '<rect x="5" y="5" width="14" height="14" rx="4"/><circle cx="12" cy="12" r="3"/>',
   fan: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2"/><path d="M12 10c0-3 1-5 3-5M14 12c3 0 5 1 5 3M12 14c0 3-1 5-3 5M10 12c-3 0-5-1-5-3"/>',
+  fans: '<circle cx="8" cy="12" r="5"/><circle cx="15.5" cy="12" r="5"/><circle cx="8" cy="12" r="1.4"/><circle cx="15.5" cy="12" r="1.4"/>',
   radio: '<rect x="8" y="10" width="8" height="11" rx="2"/><path d="M12 10V6M8 5a6 6 0 0 1 8 0M6 3a9 9 0 0 1 12 0"/>',
+  ring: '<rect x="3.5" y="6" width="17" height="12" rx="6"/><rect x="8.5" y="9.5" width="7" height="5" rx="2.5"/>',
+  ring88: '<rect x="2.5" y="7" width="19" height="10" rx="5"/><rect x="9" y="10.5" width="6" height="3" rx="1.5"/>',
+  rename: '<path d="M4 20h4l10-10a2.8 2.8 0 0 0-4-4L4 16z"/><path d="M13.5 6.5 17 10"/>',
+  locate: '<circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   power: '<path d="M12 3v8M6.3 6.3a8 8 0 1 0 11.4 0"/>',
 };

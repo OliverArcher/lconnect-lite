@@ -5,7 +5,7 @@ import { fmt, h, s } from "../dom";
 import { icon } from "../icons";
 import { fold } from "../motion";
 import { commit, store } from "../store";
-import { row, segmented, slider, toggle } from "../ui";
+import { row, segmented, slider } from "../ui";
 import type { View } from "./view";
 
 type Kind = "fan" | "pump";
@@ -36,7 +36,7 @@ export function cooling(): View {
   function submit(label: string, key: string) {
     clearTimeout(timer);
     busy = false;
-    if (draft) commit(structuredClone(draft), label, key);
+    if (draft) commit(structuredClone(draft), label, key, ["cooling"]);
   }
   function later(label: string, key: string) {
     busy = true;
@@ -70,7 +70,7 @@ export function cooling(): View {
     });
     return b;
   });
-  const presetRow = h("div", { style: "display: flex; flex-wrap: wrap; align-items: center; gap: 8px" }, h("span", { class: "subtitle", style: "margin-right: 4px" }, "从预设载入"), ...presetChips);
+  const presetRow = h("div", { style: "display: flex; flex-wrap: wrap; align-items: center; gap: 8px" }, h("span", { class: "subtitle", style: "margin-right: 4px" }, "从预设载入（只影响没有单独设置的组）"), ...presetChips);
 
   // ---------- 曲线卡片 ----------
   const editors = (["fan", "pump"] as Kind[]).map((k) => curveCard(k));
@@ -375,7 +375,6 @@ export function cooling(): View {
   // 读不到 CPU 温度 / 功耗时，这两项的说明后面附上原因。
   const pumpBoostDesc = h("span", { class: "row-desc" });
   const guardDesc = h("span", { class: "row-desc" });
-  const fanTiles = h("div", { class: "fan-tiles" });
   const advHead = h("button", { type: "button", class: "collapse-head", "aria-expanded": "true" }, "高级", icon("chevronUp"));
   // 前馈只在曲线模式下生效，其他模式不显示。
   const cpuRow = row("CPU 负载前馈", "CPU 满载时额外加的风扇转速，不等水温升起来", cpuBoost.input, cpuBoost.out);
@@ -390,7 +389,6 @@ export function cooling(): View {
     guardRow,
     cpuRow,
     gpuRow,
-    h("div", { class: "row row-stack" }, h("div", { class: "row-text" }, h("span", {}, "单个风扇"), h("span", { class: "row-desc" }, "在整体转速上加减，或单独固定某个风扇")), fanTiles),
   );
   advBody.querySelectorAll(".row").forEach((r) => ((r as HTMLElement).style.borderTop = "1px solid var(--line)"));
   advHead.addEventListener("click", () => {
@@ -407,59 +405,20 @@ export function cooling(): View {
     h(
       "header",
       { class: "page-head" },
-      h("div", { class: "page-title" }, h("h1", {}, "散热"), h("span", { class: "subtitle" }, "改动立即生效，可随时撤销")),
-      h("div", { style: "display: flex; align-items: center; gap: 12px" }, h("span", { class: "subtitle" }, "控制方式"), modeSeg.el),
+      h("div", { class: "page-title" }, h("h1", {}, "水冷"), h("span", { class: "subtitle" }, "泵、前馈与保护在这里；风扇按组单独设置")),
+      h(
+        "div",
+        { style: "display: flex; align-items: center; gap: 12px" },
+        h("a", { href: "#/fans", class: "btn btn-ghost btn-sm" }, "风扇分组…"),
+        h("span", { class: "subtitle" }, "控制方式"),
+        modeSeg.el,
+      ),
     ),
     presetRow,
     curveSection,
     fixedList,
     h("section", { class: "list" }, advHead, advBody),
   );
-
-  /** 单风扇：偏移用加减按钮，“固定”打开后加减的是固定值。焦点在里面时不重建。 */
-  let tilesKey = "";
-  function drawFanTiles() {
-    if (!draft) return;
-    const groups = store.status?.fan_groups ?? [];
-    const key = JSON.stringify([groups.map((g) => [g.address, g.rpm.length]), draft.cooling.fan_overrides]);
-    if (key === tilesKey || fanTiles.contains(document.activeElement)) return;
-    tilesKey = key;
-    const tiles = groups.flatMap((g) =>
-      g.rpm.map((_, i) => {
-        const o = () => draft!.cooling.fan_overrides.find((x) => x.address === g.address && x.index === i);
-        const set = (off: number, fixed: number | null) => {
-          const list = draft!.cooling.fan_overrides.filter((x) => !(x.address === g.address && x.index === i));
-          if (off !== 0 || fixed != null) list.push({ address: g.address, index: i, offset_percent: off, fixed_percent: fixed });
-          draft!.cooling.fan_overrides = list;
-          tilesKey = "";
-          drawFanTiles();
-          later(`风扇 ${i + 1} 调整`, `fan-${i}`);
-        };
-        const cur = o();
-        const fixed = cur?.fixed_percent ?? null;
-        const value = h("span", { style: fixed == null && (cur?.offset_percent ?? 0) !== 0 ? "color: var(--accent)" : "" }, fixed != null ? `${fixed}%` : cur?.offset_percent ? `${cur.offset_percent > 0 ? "+" : ""}${cur.offset_percent}%` : "±0%");
-        const minus = h("button", { type: "button", "aria-label": `风扇 ${i + 1} 减少` }, "−");
-        const plus = h("button", { type: "button", "aria-label": `风扇 ${i + 1} 增加` }, "+");
-        const step = (d: number) => {
-          const c = o();
-          if (c?.fixed_percent != null) set(c.offset_percent, clamp(c.fixed_percent + d, 20, 100));
-          else set(clamp((c?.offset_percent ?? 0) + d, -50, 50), null);
-        };
-        minus.addEventListener("click", () => step(-1));
-        plus.addEventListener("click", () => step(1));
-        const fix = toggle(`风扇 ${i + 1} 固定`, (on) => set(o()?.offset_percent ?? 0, on ? clamp(Math.round(store.status?.fan_percent ?? 50), 20, 100) : null));
-        fix.checked = fixed != null;
-        return h(
-          "div",
-          { class: "fan-tile" },
-          h("span", {}, `风扇 ${i + 1}`),
-          h("div", { class: "stepper" }, minus, value, plus),
-          h("label", { class: "inline-switch small muted" }, fix, "固定"),
-        );
-      }),
-    );
-    fanTiles.replaceChildren(...(tiles.length ? tiles : [h("span", { class: "small muted" }, "没有发现本机绑定的无线风扇")]));
-  }
 
   function redraw() {
     if (!draft) return;
@@ -494,7 +453,6 @@ export function cooling(): View {
     const missing = why ? `。现在读不到 CPU 数据：${why}` : "";
     pumpBoostDesc.textContent = `CPU 功耗 50 W 起，到 200 W 时泵额外加这么多，负载一来就加速，不等水温升起来${missing}`;
     guardDesc.textContent = `CPU 封装温度到这里时泵拉满、风扇至少 80%，降 8 °C 后恢复；所有控制方式下都生效${missing}`;
-    drawFanTiles();
   }
 
   function update() {

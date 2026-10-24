@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub ring88: Ring88Status,
     pub uptime_s: u64,
     pub mode: Option<CoolingMode>,
     /// 低通滤波后的水温（°C），曲线用的就是它。
@@ -52,9 +54,27 @@ pub struct Status {
     pub memory_mb: Option<f32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Ring88Status {
+    /// 8.8灯环PID 0416:8050在总线上枚举到，不代表被本服务接管。
+    #[serde(default)] pub present: bool,
+    /// 灯环句柄已打开、正在由本服务控制。
+    pub connected: bool,
+    /// 配对的显示PID 1CBE:A088只做只读枚举，画面仍归LP。
+    #[serde(default)] pub display_present: bool,
+    pub error: Option<String>,
+    pub external_display: bool,
+}
+
 /// 一个无线风扇组（一条 RX 设备记录，最多 4 个风扇）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanGroup {
+    #[serde(default)]
+    pub target_percent: Option<f32>,
+    #[serde(default)]
+    pub source_error: Option<String>,
+    #[serde(default)]
+    pub supports_control: bool,
     pub address: String,
     pub kind: String,
     pub rpm: Vec<u16>,

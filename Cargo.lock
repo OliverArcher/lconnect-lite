@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "lcl-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "lcl-core",
  "lcl-effects",
@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "lcl-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "interprocess",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "lcl-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1981,7 +1981,6 @@ dependencies = [
  "lcl-core",
  "lcl-devices",
  "lcl-effects",
- "lcl-media",
  "tray-icon 0.26.1",
  "windows-sys 0.59.0",
  "winreg",
@@ -1989,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "lcl-devices"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "cbc",
@@ -2000,8 +1999,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "lcl-display-host"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "image",
+ "lcl-core",
+ "lcl-media",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "lcl-effects"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2009,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "lcl-media"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -2020,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "lcl-sensord"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "lcl-core",

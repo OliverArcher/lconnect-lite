@@ -1,6 +1,8 @@
 //! 后台服务：独占设备，每秒一轮控制循环，状态和配置通过命名管道给 GUI。
 
 use crate::cpu::CpuUsage;
+use lcl_core::group_control::{GroupInputs,GroupOutput,GroupRuntime,GroupSource};
+use std::collections::HashMap;
 use crate::h2slot::H2Slot;
 use crate::lcd;
 use crate::lighting::LightingCtl;
@@ -42,6 +44,8 @@ struct Shared {
     status: Status,
     config: Config,
     lcd: lcd::LcdState,
+    lcd_frame: Option<Vec<u8>>,
+    ring88: lcl_core::status::Ring88Status,
     /// 最近 2 分钟的读数：界面打开时走势图直接是满的。
     history: History,
     /// 界面排队的设备操作，控制线程每轮开始时取走执行，结果从通道传回。
@@ -53,6 +57,7 @@ enum DeviceOp {
     Unbind([u8; 6]),
     MbLightSync([u8; 6], bool),
     Channel(u8),
+    Identify([u8;6]),
 }
 
 /// 设备操作要等控制线程执行；绑定最多 5 秒收敛再加保存，给足余量。
@@ -76,6 +81,8 @@ pub fn serve(devices_enabled: bool) -> Result<()> {
         status: Status::default(),
         config,
         lcd: lcd::LcdState::default(),
+        lcd_frame:None,
+        ring88:lcl_core::status::Ring88Status{external_display:true,..Default::default()},
         history: History::default(),
         ops: Vec::new(),
     }));
@@ -109,8 +116,8 @@ pub fn serve(devices_enabled: bool) -> Result<()> {
                 &h2,
                 &stop,
                 || {
-                    let s = shared.lock().unwrap();
-                    (s.config.lcd.clone(), s.status.clone())
+                    let mut s = shared.lock().unwrap();
+                    (s.config.lcd.clone(), s.lcd_frame.take())
                 },
                 |state| {
                     let mut s = shared.lock().unwrap();
@@ -119,10 +126,17 @@ pub fn serve(devices_enabled: bool) -> Result<()> {
             )
         })
     };
+    let ring = {
+        let (shared,stop)=(Arc::clone(&shared),Arc::clone(&stop));
+        std::thread::spawn(move || crate::ring_service::run(&stop,devices_enabled,
+            || shared.lock().unwrap().config.ring88.clone(),
+            |status| shared.lock().unwrap().ring88=status))
+    };
     tray::run(&TrayHost(Arc::clone(&shared)), &stop);
     stop.store(true, Ordering::SeqCst);
     let _ = control.join();
     let _ = screen.join();
+    let _ = ring.join();
     log::line("后台服务已停止，设备保持最后收到的转速");
     Ok(())
 }
@@ -178,6 +192,7 @@ fn set_channel(shared: &Mutex<Shared>, channel: u8) -> Result<()> {
 }
 
 fn apply_config(shared: &Mutex<Shared>, mut config: Config) -> Result<()> {
+    config.validate()?;
     config.normalize();
     config.save()?;
     sync_control_snapshot(&config);
@@ -208,12 +223,37 @@ fn run_op(shared: &Mutex<Shared>, op: DeviceOp, timeout: Duration) -> Result<()>
     }
 }
 
+/// Header-level size/type validation without loading an image decoder into daemon.
+fn valid_jpeg_frame(b:&[u8])->bool {
+    if b.len()<12 || b.len()>512000 || b[..2]!=[0xff,0xd8] || b[b.len()-2..]!=[0xff,0xd9] {return false;}
+    let mut p=2usize;
+    while p+4<=b.len() {
+        if b[p]!=0xff{return false;}
+        let marker=b[p+1];p+=2;
+        let n=u16::from_be_bytes([b[p],b[p+1]]) as usize;
+        if n<2 || p+n>b.len(){return false;}
+        if marker==0xc0 {
+            return n>=11 && matches!(b[p+7],1|3) && n==8+3*usize::from(b[p+7]) && b[p+2]==8 && u16::from_be_bytes([b[p+3],b[p+4]])==480 && u16::from_be_bytes([b[p+5],b[p+6]])==480;
+        }
+        if marker==0xda || marker==0xd9{return false;}
+        p+=n;
+    }
+    false
+}
+
 fn handle(shared: &Mutex<Shared>, req: Request) -> Response {
     let result = match req {
         Request::GetStatus => {
-            return Response::Status {
-                status: shared.lock().unwrap().status.clone(),
-            }
+            let s=shared.lock().unwrap();
+            let mut status=s.status.clone();status.ring88=s.ring88.clone();
+            return Response::Status { status }
+        }
+        Request::SubmitLcdFrame { jpeg } => {
+            if !valid_jpeg_frame(&jpeg) {return Response::Error{message:"帧必须是小于512KB的480×480基线JPEG".into()};}
+            let mut s=shared.lock().unwrap();
+            if s.config.lcd.mode==lcl_core::LcdMode::Unmanaged {return Response::Error{message:"冷头屏幕为外部未接管模式".into()};}
+            s.lcd_frame=Some(jpeg);
+            Ok(())
         }
         Request::GetConfig => {
             return Response::Config {
@@ -225,6 +265,20 @@ fn handle(shared: &Mutex<Shared>, req: Request) -> Response {
                 enabled: autostart::is_enabled(),
             }
         }
+        Request::GetGroupLightingCaps { address } => {
+            let s=shared.lock().unwrap();
+            let Some(g)=s.status.fan_groups.iter().find(|g|g.address.eq_ignore_ascii_case(&address) && g.supports_control) else {return Response::Error{message:"设备离线或不支持灯效".into()};};
+            let fan_count=g.rpm.len().clamp(1,4) as u8;
+            return Response::LightingCaps{caps:LightingCaps{fan_count,fans:lcl_effects::tl::parameters::for_fans(fan_count),pump:lcl_effects::h2::parameters()}};
+        }
+        Request::RenameDevice { address, name } => {
+            let mac=match lcl_core::parse_mac(&address){Some(m)=>m,None=>return Response::Error{message:"无效设备地址".into()}};
+            let mut cfg=shared.lock().unwrap().config.clone();
+            if name.trim().is_empty(){cfg.devices.aliases.remove(&lcl_devices::wireless::fmt_mac(&mac));}
+            else {cfg.devices.aliases.insert(lcl_devices::wireless::fmt_mac(&mac),name.trim().to_owned());}
+            apply_config(shared,cfg)
+        }
+        Request::IdentifyDevice { address } => queue_op(shared,&address,DeviceOp::Identify),
         Request::GetLightingCaps => {
             let fan_count = shared.lock().unwrap().status.fan_groups.first().map_or(3, |g| g.rpm.len()) as u8;
             return Response::LightingCaps {
@@ -299,6 +353,8 @@ struct Controller {
     lighting: LightingCtl,
     /// 锁定过滤之前的这一轮无线快照，给状态里的“全部设备”列表用。
     last_full: Option<Snapshot>,
+    wireless_poll_error: Option<String>,
+    last_rx_layout: String,
     /// 最近一次有效的主板 PWM 采样（RX 偶尔回坏包时用缓存，不带这个值）。
     mb_pwm: Option<(u8, Instant)>,
     errors: Vec<String>,
@@ -314,6 +370,9 @@ struct Controller {
     cpu_guard: bool,
     /// 已经记过“传感器服务在开机接管”的日志。
     keeper_seen: bool,
+    group_runtime: HashMap<String,GroupRuntime>,
+    group_outputs: HashMap<String,GroupOutput>,
+    identified_at: HashMap<[u8;6],Instant>,
 }
 
 impl Controller {
@@ -335,6 +394,8 @@ impl Controller {
             coolant_filtered: None,
             lighting: LightingCtl::default(),
             last_full: None,
+            wireless_poll_error: None,
+            last_rx_layout: String::new(),
             mb_pwm: None,
             errors: Vec::new(),
             channel_pending: false,
@@ -343,6 +404,9 @@ impl Controller {
             cpu_power: None,
             cpu_guard: false,
             keeper_seen: false,
+            group_runtime: HashMap::new(),
+            group_outputs: HashMap::new(),
+            identified_at: HashMap::new(),
         }
     }
 
@@ -352,7 +416,8 @@ impl Controller {
     fn update_gpu(&mut self, config: &Config) {
         let c = &config.cooling;
         let needed = (c.mode == CoolingMode::Curve && (c.fan_source == TempSource::Gpu || c.gpu_boost_percent > 0.0))
-            || config.lcd.mode == lcl_core::LcdMode::Dashboard;
+            || config.lcd.mode == lcl_core::LcdMode::Dashboard
+            || c.groups.iter().any(|g|g.mode==CoolingMode::Curve && g.source==GroupSource::Gpu);
         // 没有 N 卡时别每秒都去试。
         if needed && self.gpu.is_none() && self.gpu_open_tried.map_or(true, |t| t.elapsed() >= GPU_RETRY) {
             self.gpu_open_tried = Some(Instant::now());
@@ -433,14 +498,16 @@ impl Controller {
             TempSource::Coolant => coolant,
             TempSource::Gpu => gpu.temp_c,
         };
+        let has_cooler=self.h2.lock().is_some() || aio.is_some();
+        let needs_global_fan=has_cooler || snap.as_ref().is_some_and(|s|s.devices.iter().any(|d|d.supports_fan_control() && !c.groups.iter().any(|g|g.address==d.mac_str())));
         let fan_curve_target = match (c.mode, fan_temp) {
             (CoolingMode::Curve, Some(t)) => c.fan_curve.eval(t),
             (CoolingMode::Curve, None) => {
-                self.errors.push(format!("没有{}读数，风扇暂用固定值", temp_source_name(c.fan_source)));
+                if needs_global_fan {self.errors.push(format!("没有{}读数，未独立配置的风扇组暂用固定值", temp_source_name(c.fan_source)));}
                 None
             }
             (CoolingMode::Motherboard, _) => {
-                if mb_percent.is_none() {
+                if needs_global_fan && mb_percent.is_none() {
                     self.errors.push("没有采样到主板 PWM（RX 没接信号线？），风扇暂用固定值".into());
                 }
                 mb_percent
@@ -450,7 +517,7 @@ impl Controller {
         let pump_target = match (c.mode, coolant) {
             (CoolingMode::Curve, Some(t)) => c.pump_curve.eval(t),
             (CoolingMode::Curve, None) => {
-                self.errors.push("没有水温读数，泵暂用固定值".into());
+                if has_cooler {self.errors.push("没有水温读数，泵暂用固定值".into());}
                 None
             }
             _ => None,
@@ -472,6 +539,7 @@ impl Controller {
         let guard = match (c.cpu_temp_limit_c > 0.0, cpu_temp) {
             (true, Some(t)) if t >= c.cpu_temp_limit_c => true,
             (true, Some(t)) if self.cpu_guard && t > c.cpu_temp_limit_c - GUARD_HYSTERESIS_C => true,
+            (true,None) => self.cpu_guard, // never clear an active thermal guard on sensor loss
             _ => false,
         };
         if guard != self.cpu_guard {
@@ -496,8 +564,16 @@ impl Controller {
         };
         self.fan_percent = Some(fan);
 
+        self.group_outputs.clear();
+        self.group_runtime.retain(|a,_|c.groups.iter().any(|g|&g.address==a));
+        for policy in &c.groups {
+            let inputs=GroupInputs{cpu:cpu_temp,gpu:gpu.temp_c,coolant,motherboard:mb_percent,guard};
+            let result=self.group_runtime.entry(policy.address.clone()).or_default().evaluate(policy,inputs,self.started.elapsed().as_secs_f64(),TICK.as_secs_f32());
+            if let Some(e)=&result.source_error {self.errors.push(format!("{}：{e}",config.devices.aliases.get(&policy.address).unwrap_or(&policy.address)));}
+            self.group_outputs.insert(policy.address.clone(),result);
+        }
         if let (Some(wl), Some(snap)) = (self.wl.as_mut(), snap.as_ref()) {
-            let out = Outputs { fan, pump_rpm, square, overrides: &c.fan_overrides };
+            let out = Outputs { fan, pump_rpm, square, overrides: &c.fan_overrides, groups: &self.group_outputs, guard };
             match drive_wireless(wl, snap, aio.as_ref(), &out) {
                 Ok(()) => self.lighting.drive_fans(&config.lighting, wl, snap, &mut self.errors),
                 Err(e) => {
@@ -599,8 +675,39 @@ impl Controller {
 
     fn poll_wireless(&mut self) -> Option<Snapshot> {
         let wl = self.wl.as_mut()?;
-        // 偶尔会读到不完整的回复，跳过这一轮、用缓存，不中断保活。
-        Some(wl.poll().unwrap_or_else(|_| wl.cached()))
+        // 缓存兜底仍然保留，但不能吞掉读取故障，否则无法区分 USB 读坏和 RF 设备失联。
+        let snap = match wl.poll() {
+            Ok(snap) => {
+                if self.wireless_poll_error.take().is_some() {
+                    log::line("无线 RX 读取已恢复");
+                }
+                snap
+            }
+            Err(e) => {
+                let message = format!("{e:#}");
+                if self.wireless_poll_error.as_ref() != Some(&message) {
+                    log::line(&format!("无线 RX 读取失败（使用限时缓存）：{message}"));
+                }
+                self.wireless_poll_error = Some(message);
+                wl.cached()
+            }
+        };
+        if self.last_rx_layout != wl.rx_diagnostic() {
+            self.last_rx_layout = wl.rx_diagnostic().to_owned();
+            log::line(&format!("无线 RX 原始记录布局：{}", self.last_rx_layout));
+        }
+        let old = self.last_full.as_ref().map(|s| s.devices.as_slice()).unwrap_or(&[]);
+        for dev in &snap.devices {
+            if !old.iter().any(|d| d.mac == dev.mac && d.master == dev.master) {
+                log::line(&format!("无线设备出现 {}：{}，风扇 {} 只，rx {}，频道 {}，主机 {}", dev.mac_str(), dev.kind(), dev.fan_count, dev.rx_type, dev.channel, fmt_mac(&dev.master)));
+            }
+        }
+        for dev in old {
+            if !snap.devices.iter().any(|d| d.mac == dev.mac && d.master == dev.master) {
+                log::line(&format!("无线设备记录过期或归属改变 {}（15 秒未收到有效记录）；上次 rx {}，频道 {}", dev.mac_str(), dev.rx_type, dev.channel));
+            }
+        }
+        Some(snap)
     }
 
     fn read_h2(&mut self) {
@@ -669,8 +776,11 @@ impl Controller {
                     pump_rpm = pump_rpm.or(d.pump_rpm());
                     continue;
                 }
-                let n = usize::from(d.fan_count);
+                let n = usize::from(d.fan_count).min(4);
                 fan_groups.push(FanGroup {
+                    target_percent: d.supports_fan_control().then(||self.group_outputs.get(&d.mac_str()).map_or(fan,|o|o.percent)),
+                    source_error: self.group_outputs.get(&d.mac_str()).and_then(|o|o.source_error.clone()),
+                    supports_control: d.supports_fan_control(),
                     address: d.mac_str(),
                     kind: d.kind().into(),
                     rpm: d.rpm[..n].to_vec(),
@@ -735,6 +845,24 @@ impl Controller {
                 None => Err("无线收发器没有连接".to_string()),
                 Some(wl) => {
                     let r = match op {
+                        DeviceOp::Identify(mac) => {
+                            if self.identified_at.get(&mac).is_some_and(|t|t.elapsed()<Duration::from_secs(5)) {
+                                Err(anyhow::anyhow!("定位请求过于频繁，请稍后重试"))
+                            } else {
+                                let snap=wl.cached();
+                                match wl.own_devices(&snap).into_iter().find(|(_,d)|d.mac==mac && d.supports_fan_control()).map(|(_,d)|d.clone()) {
+                                    Some(dev)=>{
+                                        let result=wl.identify(&dev);
+                                        if result.is_ok() {
+                                            self.identified_at.insert(mac,Instant::now());
+                                            self.lighting.suspend(mac,Duration::from_secs(5));
+                                        }
+                                        result
+                                    },
+                                    None=>Err(anyhow::anyhow!("设备未绑定在本机或已离线")),
+                                }
+                            }
+                        }
                         DeviceOp::Bind(mac) => wl.bind(&mac).map(|rx| log::line(&format!("已绑定 {}，rx {rx}", fmt_mac(&mac)))),
                         DeviceOp::Unbind(mac) => wl.unbind(&mac).map(|()| log::line(&format!("已解绑 {}", fmt_mac(&mac)))),
                         DeviceOp::Channel(channel) => {
@@ -787,16 +915,19 @@ struct Outputs<'a> {
     pump_rpm: u16,
     square: bool,
     overrides: &'a [FanOverride],
+    groups: &'a HashMap<String,GroupOutput>,
+    guard: bool,
 }
 
 impl Outputs<'_> {
     /// 某组第 `index` 个风扇的占空比：有固定值用固定值，否则全局值加偏移。
     fn fan_duty(&self, address: &str, index: usize) -> u8 {
-        let percent = match self.overrides.iter().find(|o| o.address == address && usize::from(o.index) == index) {
+        let percent = if let Some(g)=self.groups.get(address) {g.percent} else { match self.overrides.iter().find(|o| o.address == address && usize::from(o.index) == index) {
             Some(FanOverride { fixed_percent: Some(f), .. }) => *f,
             Some(o) => self.fan + o.offset_percent,
             None => self.fan,
-        };
+        }};
+        let percent=if self.guard {percent.max(GUARD_FAN_PERCENT)} else {percent};
         percent_to_duty(percent.clamp(MIN_FAN_PERCENT, 100.0))
     }
 }
@@ -821,13 +952,16 @@ fn drive_wireless(
     let targets: Vec<_> = wl
         .own_devices(snap)
         .into_iter()
-        .filter(|(_, d)| !d.is_aio())
+        .filter(|(_, d)| d.supports_fan_control())
         .map(|(slot, d)| (slot, d.clone()))
         .collect();
     for (slot, dev) in targets {
         let a = dev.mac_str();
-        let pwm = [0, 1, 2, 3].map(|i| out.fan_duty(&a, i));
-        wl.set_pwm(&dev, slot, pwm)?;
+        // A standalone wireless group is one control item. Legacy per-fan overrides
+        // are retained in the config backup but never split this group's output.
+        let percent=out.groups.get(&a).map_or(out.fan,|g|g.percent);
+        let percent=if out.guard {percent.max(GUARD_FAN_PERCENT)} else {percent};
+        wl.set_pwm(&dev, slot, [percent_to_duty(percent);4])?;
     }
     Ok(())
 }
@@ -835,6 +969,24 @@ fn drive_wireless(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_output_is_uniform_and_guard_cannot_be_bypassed() {
+        let mut groups=HashMap::new();groups.insert("aa".into(),GroupOutput{percent:35.0,source_error:None});
+        let out=Outputs{fan:50.0,pump_rpm:2000,square:true,overrides:&[],groups:&groups,guard:false};
+        for i in 0..4 {assert_eq!(out.fan_duty("aa",i),percent_to_duty(35.0));}
+        let overrides=[FanOverride{address:"aa".into(),index:0,offset_percent:0.0,fixed_percent:Some(20.0)}];
+        let out=Outputs{fan:40.0,pump_rpm:2000,square:true,overrides:&overrides,groups:&groups,guard:true};
+        assert_eq!(out.fan_duty("aa",0),percent_to_duty(80.0));
+    }
+
+    #[test]
+    fn incoming_frames_are_bounded_and_square() {
+        assert!(!valid_jpeg_frame(&[]));assert!(!valid_jpeg_frame(&vec![0;512001]));
+        let good=[0xff,0xd8,0xff,0xc0,0,11,8,1,0xe0,1,0xe0,1,1,0x11,0,0xff,0xd9];
+        assert!(valid_jpeg_frame(&good));
+        let mut wrong=good;wrong[10]=0xdf;assert!(!valid_jpeg_frame(&wrong));
+    }
 
     #[test]
     fn low_pass_smooths_integer_flicker() {
@@ -859,7 +1011,8 @@ mod tests {
             FanOverride { address: "aa".into(), index: 2, offset_percent: -50.0, fixed_percent: None },
             FanOverride { address: "aa".into(), index: 1, offset_percent: 0.0, fixed_percent: Some(80.0) },
         ];
-        let out = Outputs { fan: 40.0, pump_rpm: 2000, square: true, overrides: &overrides };
+        let groups=HashMap::new();
+        let out = Outputs { fan: 40.0, pump_rpm: 2000, square: true, overrides: &overrides, groups: &groups, guard:false };
         assert_eq!(out.fan_duty("aa", 0), percent_to_duty(50.0));
         assert_eq!(out.fan_duty("aa", 1), percent_to_duty(80.0));
         // 偏移后低于下限时抬到 20%。

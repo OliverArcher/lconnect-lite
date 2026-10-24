@@ -1,6 +1,7 @@
 //! 后台服务（lcl-daemon）和 GUI（app）共用的类型：配置文件、状态快照、命名管道协议。
 
 pub mod config;
+pub mod group_control;
 #[cfg(feature = "nvml")]
 pub mod gpu;
 pub mod ipc;

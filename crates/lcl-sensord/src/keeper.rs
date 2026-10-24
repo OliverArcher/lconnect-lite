@@ -6,6 +6,8 @@
 
 use lcl_core::config::{pump_power_boost, Config, CoolingMode, FanOverride, TempSource, GUARD_FAN_PERCENT, GUARD_HYSTERESIS_C, MIN_FAN_PERCENT, PUMP_MIN_RPM};
 use lcl_core::sensors::CpuSensors;
+use lcl_core::group_control::{GroupInputs,GroupOutput,GroupRuntime};
+use std::collections::HashMap;
 use lcl_devices::h2::H2;
 use lcl_devices::wireless::{aio_params, RfDevice, Snapshot, Wireless};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +47,7 @@ pub fn run(cpu: &Mutex<CpuSensors>, holding: &AtomicBool, stop: &AtomicBool) {
         cpu_power: None,
         guard: false,
         logged: (false, false, false),
+        started: Instant::now(), group_runtime:HashMap::new(), group_outputs:HashMap::new(),
     };
     while !stop.load(Ordering::SeqCst) && !daemon_running() {
         k.ensure_devices();
@@ -96,6 +99,9 @@ struct Keeper {
     guard: bool,
     /// 已记过日志的事件：打开冷头、打开收发器、第一次下发转速。
     logged: (bool, bool, bool),
+    started: Instant,
+    group_runtime: HashMap<String,GroupRuntime>,
+    group_outputs: HashMap<String,GroupOutput>,
 }
 
 impl Keeper {
@@ -155,7 +161,7 @@ impl Keeper {
                 Some(prev) => prev + (r - prev) * TICK.as_secs_f32() / (COOLANT_TAU.as_secs_f32() + TICK.as_secs_f32()),
                 None => r,
             });
-        }
+        } else { self.coolant=None; }
         if let Some(p) = cpu.power_w {
             self.cpu_power = Some(match self.cpu_power {
                 Some(prev) if p < prev => prev + (p - prev) * 0.05,
@@ -181,6 +187,7 @@ impl Keeper {
         self.guard = match (c.cpu_temp_limit_c > 0.0, cpu.temp_c) {
             (true, Some(t)) if t >= c.cpu_temp_limit_c => true,
             (true, Some(t)) if self.guard && t > c.cpu_temp_limit_c - GUARD_HYSTERESIS_C => true,
+            (true,None)=>self.guard,
             _ => false,
         };
         if self.guard {
@@ -188,7 +195,13 @@ impl Keeper {
             fan = fan.max(GUARD_FAN_PERCENT);
         }
         let pump = pump.clamp(PUMP_MIN_RPM, max_pump).round() as u16;
-        let out = Outputs { fan, pump, square, overrides: &c.fan_overrides };
+        self.group_outputs.clear();
+        for p in &c.groups {
+            let inputs=GroupInputs{cpu:cpu.temp_c,gpu:None,coolant:self.coolant,motherboard:snap.as_ref().and_then(|s|s.mb_pwm).filter(|d|*d>0).map(|v|v as f32*100.0/255.0),guard:self.guard};
+            let o=self.group_runtime.entry(p.address.clone()).or_default().evaluate(p,inputs,self.started.elapsed().as_secs_f64(),1.0);
+            self.group_outputs.insert(p.address.clone(),o);
+        }
+        let out = Outputs { fan, pump, square, overrides: &c.fan_overrides,groups:&self.group_outputs,guard:self.guard };
         if !self.logged.2 && (self.h2.is_some() || self.wl.is_some()) {
             self.logged.2 = true;
             let water = self.coolant.map_or("—".to_string(), |t| format!("{t:.0}"));
@@ -218,6 +231,8 @@ struct Outputs<'a> {
     pump: u16,
     square: bool,
     overrides: &'a [FanOverride],
+    groups: &'a HashMap<String,GroupOutput>,
+    guard: bool,
 }
 
 impl Outputs<'_> {
@@ -227,12 +242,12 @@ impl Outputs<'_> {
 
     /// 和后台服务一样：单个风扇有固定值用固定值，否则整体值加偏移。
     fn fan_duty(&self, address: &str, index: usize) -> u8 {
-        let percent = match self.overrides.iter().find(|o| o.address == address && usize::from(o.index) == index) {
+        let percent = if let Some(g)=self.groups.get(address) {g.percent} else {match self.overrides.iter().find(|o| o.address == address && usize::from(o.index) == index) {
             Some(FanOverride { fixed_percent: Some(f), .. }) => *f,
             Some(o) => self.fan + o.offset_percent,
             None => self.fan,
-        };
-        self.duty(percent)
+        }};
+        self.duty(if self.guard{percent.max(GUARD_FAN_PERCENT)}else{percent})
     }
 }
 
@@ -246,10 +261,11 @@ fn drive_wireless(wl: &mut Wireless, snap: &Snapshot, aio: Option<&(u8, RfDevice
             wl.set_pwm(dev, *slot, [out.fan_duty(&a, 0), out.fan_duty(&a, 1), out.fan_duty(&a, 2), dev.pwm[3]])?;
         }
     }
-    let targets: Vec<(u8, RfDevice)> = wl.own_devices(snap).into_iter().filter(|(_, d)| !d.is_aio()).map(|(s, d)| (s, d.clone())).collect();
+    let targets: Vec<(u8, RfDevice)> = wl.own_devices(snap).into_iter().filter(|(_, d)| d.supports_fan_control()).map(|(s, d)| (s, d.clone())).collect();
     for (slot, dev) in targets {
         let a = dev.mac_str();
-        wl.set_pwm(&dev, slot, [0, 1, 2, 3].map(|i| out.fan_duty(&a, i)))?;
+        let percent=out.groups.get(&a).map_or(out.fan,|g|g.percent);
+        wl.set_pwm(&dev,slot,[out.duty(if out.guard{percent.max(GUARD_FAN_PERCENT)}else{percent});4])?;
     }
     Ok(())
 }

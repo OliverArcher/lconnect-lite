@@ -608,6 +608,50 @@ input[type="range"] { accent-color: var(--accent); }
 .nearby + .nearby { border-top: 1px solid var(--line); }
 .scan { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 
+/* ---------- 风扇分组 ---------- */
+.group-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); gap: 16px; align-items: start; }
+.group-card { padding: 18px; gap: 14px; }
+.group-head { display: flex; align-items: flex-start; gap: 12px; }
+.group-head .device-icon { width: 40px; height: 40px; border-radius: 11px; }
+.group-head .device-icon svg { width: 22px; height: 22px; }
+.group-title { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.group-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-actions { flex: none; display: flex; align-items: center; gap: 4px; }
+.group-now { display: flex; flex-direction: column; gap: 2px; min-height: 36px; }
+.group-readings { font-size: 13px; color: var(--text-2); }
+.group-foot { margin-top: auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
+.group-foot-actions { display: flex; align-items: center; gap: 8px; }
+.group-curve { display: flex; flex-direction: column; gap: 10px; }
+.group-curve-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.curve-editor { display: flex; flex-direction: column; gap: 8px; }
+.group-card .adv-body { background: var(--surface-2); border-color: var(--line); }
+.group-card.is-readonly .seg,
+.group-card.is-readonly .curve-editor { opacity: 0.55; }
+.list-note { font-size: 13px; color: var(--muted); }
+.list-note.empty { padding: 22px; border: 1px dashed var(--line-2); border-radius: 14px; text-align: center; }
+
+/* ---------- 按组灯效 ---------- */
+.group-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.group-chips .chip svg { width: 15px; height: 15px; }
+
+/* ---------- 8.8 灯环 ---------- */
+.banner { display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px; border-radius: 14px; border: 1px solid var(--line-2); background: var(--surface); }
+.banner svg { width: 18px; height: 18px; flex: none; margin-top: 2px; }
+.banner-text { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.banner-text b { font-weight: 600; }
+.banner-warn { border-color: #5a4527; background: #1f1a12; color: #f0c48a; }
+.banner-info { border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent); }
+.banner-info b { color: var(--text); }
+.lighting-fan-panel[hidden], .ring88-panel[hidden] { display: none !important; }
+.ring88-panel { display: flex; flex-direction: column; gap: 12px; }
+.ring-stage { min-height: 250px; }
+.ring-stage .stage-inner { max-width: 460px; }
+.ring-modes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.ring-mode { justify-content: center; align-items: center; padding: 12px 8px; gap: 0; }
+.ring-mode .t { font-size: 13px; }
+.ring-colors { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ring-connection { margin-top: auto; min-height: 38px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-1); }
+
 /* ---------- 浮层 ---------- */
 /* 提示放在右下角，不盖住页面中间的控件；新的在下面。 */
 .toasts { position: fixed; right: 24px; bottom: 24px; width: min(420px, calc(100vw - 280px)); display: flex; flex-direction: column; align-items: flex-end; gap: 8px; pointer-events: none; z-index: 50; }

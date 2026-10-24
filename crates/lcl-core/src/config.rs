@@ -10,9 +10,11 @@ use std::path::PathBuf;
 pub const MIN_FAN_PERCENT: f32 = 20.0;
 pub const PUMP_MIN_RPM: f32 = 1600.0;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub schema_version: u32,
+    pub ring88: Ring88Config,
     pub cooling: Cooling,
     pub lighting: Lighting,
     pub lcd: Lcd,
@@ -22,6 +24,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Devices {
+    pub aliases: std::collections::BTreeMap<String, String>,
     /// 锁定绑定：非空时只控制列表里的无线设备（MAC），其他绑定在本机的设备一律不碰。
     /// 和官方的“锁定”一样只在主机这边生效，不向设备发任何东西。
     pub locked: Vec<String>,
@@ -109,6 +112,7 @@ impl Default for Lcd {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Lighting {
+    pub groups: Vec<GroupLighting>,
     /// 关闭时完全不碰灯，设备保持现有的灯效（比如 L-Connect 之前设的）。
     pub enabled: bool,
     /// 无线风扇：一个“全部”区域，或者“上弧”“下弧”两个区域。
@@ -134,6 +138,7 @@ impl Default for Lighting {
             ..RgbEffect::default()
         };
         Self {
+            groups: Vec::new(),
             enabled: false,
             fans: vec![RgbRegionConfig {
                 effect: rainbow.clone(),
@@ -181,6 +186,7 @@ pub struct FanOverride {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Cooling {
+    pub groups: Vec<crate::group_control::FanGroupPolicy>,
     pub mode: CoolingMode,
     pub fixed_fan_percent: f32,
     pub fixed_pump_rpm: f32,
@@ -221,6 +227,7 @@ pub fn pump_power_boost(power_w: f32, boost_rpm: f32) -> f32 {
 impl Default for Cooling {
     fn default() -> Self {
         Self {
+            groups: Vec::new(),
             mode: CoolingMode::Curve,
             fixed_fan_percent: 50.0,
             fixed_pump_rpm: 2400.0,
@@ -301,7 +308,35 @@ pub fn control_snapshot_path() -> PathBuf {
     base.join("LConnect Lite").join("control.toml")
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupLighting { pub address: String, pub enabled: bool, pub regions: Vec<RgbRegionConfig> }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Ring88Config { pub enabled: bool, pub effect: RgbEffect }
+impl Default for Config {
+    fn default() -> Self { Self { schema_version: 2, ring88: Ring88Config::default(), cooling: Cooling::default(), lighting: Lighting::default(), lcd: Lcd::default(), devices: Devices::default() } }
+}
 impl Config {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.schema_version <= 2, "配置版本高于当前程序，请勿降级覆盖");
+        let c=&self.cooling;
+        for n in [c.fixed_fan_percent,c.fixed_pump_rpm,c.fan_slew_percent_per_s,c.cpu_boost_percent,c.gpu_boost_percent,c.pump_power_boost_rpm,c.cpu_temp_limit_c] {
+            anyhow::ensure!(n.is_finite(), "散热配置含非有限值");
+        }
+        for curve in [&c.fan_curve,&c.pump_curve] {
+            anyhow::ensure!(!curve.points.is_empty() && curve.points.len()<=32 && curve.points.iter().flatten().all(|v|v.is_finite()), "无效散热曲线");
+        }
+        for o in &c.fan_overrides {anyhow::ensure!(o.offset_percent.is_finite() && o.fixed_percent.is_none_or(f32::is_finite), "旧风扇覆盖包含非法值");}
+        let mut addresses=std::collections::BTreeSet::new();
+        for g in &self.cooling.groups {g.validate()?; anyhow::ensure!(addresses.insert(g.address.to_ascii_lowercase()), "重复的风扇组策略");}
+        let mut lights=std::collections::BTreeSet::new();
+        for g in &self.lighting.groups {
+            anyhow::ensure!(crate::parse_mac(&g.address).is_some(), "无效灯效设备地址");
+            anyhow::ensure!(lights.insert(g.address.to_ascii_lowercase()), "重复的风扇灯效策略");
+        }
+        for (a,n) in &self.devices.aliases { anyhow::ensure!(crate::parse_mac(a).is_some() && n.chars().count()<=48 && !n.chars().any(char::is_control), "无效设备名称或地址"); }
+        Ok(())
+    }
     /// 写开机接管用的副本（见 [`control_snapshot_path`]）。目录由安装程序建好并开放给普通用户写。
     pub fn save_control_snapshot(&self) -> Result<()> {
         let path = control_snapshot_path();
@@ -315,6 +350,7 @@ impl Config {
     pub fn load_control_snapshot() -> Option<Self> {
         let text = std::fs::read_to_string(control_snapshot_path()).ok()?;
         let mut config: Self = toml::from_str(&text).ok()?;
+        config.validate().ok()?;
         config.normalize();
         Some(config)
     }
@@ -331,6 +367,7 @@ impl Config {
     /// 解析并规范化；用于导入别处导出的配置。
     pub fn from_toml(text: &str) -> Result<Self> {
         let mut config: Self = toml::from_str(text).context("不是有效的 LConnect Lite 配置文件")?;
+        config.validate()?;
         config.normalize();
         Ok(config)
     }
@@ -345,6 +382,9 @@ impl Config {
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("读取 {}", path.display()))?;
         let mut config: Self = toml::from_str(&text).with_context(|| format!("解析 {}", path.display()))?;
+        config.validate()?;
+        let backup=path.with_extension("toml.pre-groups.bak");
+        if !backup.exists() { std::fs::copy(&path,&backup).context("备份旧配置失败")?; }
         config.normalize();
         Ok(config)
     }
@@ -359,6 +399,10 @@ impl Config {
 
     /// 曲线排序、数值截到硬件允许的范围。
     pub fn normalize(&mut self) {
+        self.schema_version=2;
+        self.devices.aliases=std::mem::take(&mut self.devices.aliases).into_iter().map(|(k,v)|(k.to_ascii_lowercase(),v.trim().to_owned())).filter(|(_,v)|!v.is_empty()).collect();
+        for g in &mut self.cooling.groups { g.normalize(); }
+        for g in &mut self.lighting.groups {g.address=g.address.to_ascii_lowercase();}
         let c = &mut self.cooling;
         c.fan_curve.sort();
         c.pump_curve.sort();
@@ -391,6 +435,25 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn grouped_config_names_and_policies_survive_roundtrip() {
+        let mut cfg=Config::default();
+        cfg.devices.aliases.insert("AA:BB:CC:DD:EE:FF".into(),"后部排风".into());
+        let mut a=crate::group_control::FanGroupPolicy::default();a.address="aa:bb:cc:dd:ee:ff".into();a.mode=CoolingMode::Fixed;a.fixed_percent=35.0;
+        let mut b=a.clone();b.address="11:22:33:44:55:66".into();b.fixed_percent=55.0;
+        cfg.cooling.groups=vec![a,b];
+        cfg.validate().unwrap();cfg.normalize();
+        assert_eq!(cfg.devices.aliases["aa:bb:cc:dd:ee:ff"],"后部排风");
+        let restored=Config::from_toml(&cfg.to_toml().unwrap()).unwrap();assert_eq!(restored,cfg);
+        assert_ne!(restored.cooling.groups[0].fixed_percent,restored.cooling.groups[1].fixed_percent);
+    }
+
+    #[test]
+    fn future_versions_and_duplicate_targets_are_rejected() {
+        let mut cfg=Config::default();cfg.schema_version=99;assert!(cfg.validate().is_err());
+        cfg.schema_version=2;let mut a=crate::group_control::FanGroupPolicy::default();a.address="aa:bb:cc:dd:ee:ff".into();cfg.cooling.groups=vec![a.clone(),a];assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn pump_power_boost_is_linear_between_thresholds() {

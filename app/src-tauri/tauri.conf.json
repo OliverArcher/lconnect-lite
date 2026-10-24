@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LConnect Lite",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "identifier": "com.creeperux.lconnect-lite",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -28,10 +28,10 @@
     "targets": [
       "nsis"
     ],
-    "publisher": "CreeperUX",
+    "publisher": "OliverArcher",
     "copyright": "MIT License · 与联力（Lian Li）官方无关",
     "shortDescription": "LConnect Lite",
-    "longDescription": "隐流二代 LCD-S 水冷和 UNI FAN TL 无线风扇的轻量控制软件，L-Connect 3 的替代品。",
+    "longDescription": "TL无线风扇组独立调速与灯效、8.8灯环控制，保留水冷支持；屏幕内容由外部宿主管理。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,7 +40,8 @@
     ],
     "externalBin": [
       "binaries/lcl-daemon",
-      "binaries/lcl-sensord"
+      "binaries/lcl-sensord",
+      "binaries/lcl-display-host"
     ],
     "licenseFile": "installer/notice.txt",
     "windows": {

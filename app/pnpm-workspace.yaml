@@ -1,0 +1,6 @@
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@tauri-apps/cli-darwin-x64@2.12.4'
+  - '@tauri-apps/cli-linux-arm64-gnu@2.12.4'
+  - '@tauri-apps/cli-win32-ia32-msvc@2.12.4'

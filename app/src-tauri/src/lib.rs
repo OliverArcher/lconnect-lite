@@ -77,6 +77,15 @@ async fn get_lighting_caps() -> Result<lcl_core::ipc::LightingCaps, String> {
 }
 
 #[tauri::command]
+async fn identify_device(address:String)->Result<(),String>{ expect_ok(Request::IdentifyDevice{address}).await }
+#[tauri::command]
+async fn rename_device(address:String,name:String)->Result<(),String>{ expect_ok(Request::RenameDevice{address,name}).await }
+#[tauri::command]
+async fn get_group_lighting_caps(address:String)->Result<lcl_core::ipc::LightingCaps,String>{
+    match call(Request::GetGroupLightingCaps{address}).await? {Response::LightingCaps{caps}=>Ok(caps),other=>Err(unexpected(other))}
+}
+
+#[tauri::command]
 async fn get_lcd_state() -> Result<lcl_core::ipc::LcdState, String> {
     match call(Request::GetLcdState).await? {
         Response::LcdState { state } => Ok(state),
@@ -331,12 +340,9 @@ const _ICON_DEPS: [&[u8]; 2] = [include_bytes!("../icons/icon.ico"), include_byt
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 后台服务没在运行就顺手启动（安装后第一次打开、或者被退出了）。在后台线程里做，不耽误窗口出来。
-    std::thread::spawn(|| {
-        if ipc::request(&Request::GetStatus).is_err() {
-            let _ = start_daemon();
-        }
-    });
+    // Experimental build: opening the window must not silently seize USB devices.
+    // Users explicitly start the daemon from the offline banner after stopping
+    // other controllers. An already-running daemon is connected normally.
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -350,6 +356,9 @@ pub fn run() {
             get_config,
             set_config,
             get_lighting_caps,
+            get_group_lighting_caps,
+            identify_device,
+            rename_device,
             get_lcd_state,
             get_history,
             read_gif,

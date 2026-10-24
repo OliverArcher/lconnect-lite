@@ -7,6 +7,16 @@ use std::time::Duration;
 const EP_OUT: u8 = 0x01;
 const EP_IN: u8 = 0x81;
 
+/// Read-only USB enumeration: does not open, claim, reset, or send to matching devices.
+pub fn device_present(ids: &[(u16,u16)]) -> Result<bool> {
+    for device in rusb::devices()?.iter() {
+        if let Ok(desc)=device.device_descriptor() {
+            if ids.contains(&(desc.vendor_id(),desc.product_id())) {return Ok(true);}
+        }
+    }
+    Ok(false)
+}
+
 pub struct UsbDev {
     /// 只在 `reopen` 的关闭与重新打开之间为空。
     handle: Option<DeviceHandle<GlobalContext>>,

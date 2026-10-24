@@ -6,7 +6,7 @@ import { modeName } from "../modes";
 import { countTo } from "../motion";
 import { commit, store, type History } from "../store";
 import { segmented } from "../ui";
-import type { LightingPreview } from "../api";
+import type { Lighting, LightingPreview } from "../api";
 import type { View } from "./view";
 
 const GAUGE_MIN = 20;
@@ -80,7 +80,7 @@ export function overview(): View {
     PRESETS.map((p) => ({ value: p.id, label: p.name })),
     (id) => {
       const p = PRESETS.find((x) => x.id === id)!;
-      if (store.config) commit(applyPreset(store.config, p), `${p.name}档位`, "preset");
+      if (store.config) commit(applyPreset(store.config, p), `${p.name}档位`, "preset", ["cooling"]);
     },
     { label: "散热档位" },
   );
@@ -167,7 +167,9 @@ export function overview(): View {
   const lcdBright = h("span", { class: "small muted" });
   let lastLcd = 0;
 
-  const dials = [0, 1, 2].map((i) => dial(`风扇 ${i + 1}`, "var(--c-fan)"));
+  const groupDials = new Map<string, ReturnType<typeof dial>>();
+  const dialList = h("div", { class: "dials" });
+  let dialLayoutKey = "";
   const pumpDial = dial("泵", "var(--c-pump)");
 
   const root = h(
@@ -217,7 +219,7 @@ export function overview(): View {
       "section",
       { class: "card", "aria-label": "风扇和泵" },
       h("div", { class: "card-head" }, h("h2", {}, "风扇和泵"), h("span", { class: "small muted", id: "dial-sub" })),
-      h("div", { class: "dials" }, ...dials.map((d) => d.el), pumpDial.el),
+      dialList,
     ),
   );
   lcdImg.hidden = true;
@@ -285,17 +287,22 @@ export function overview(): View {
   async function refreshLighting() {
     const cfg = store.config;
     if (!cfg) return;
-    const fanCount = store.status?.fan_groups[0]?.rpm.length ?? 3;
-    const key = JSON.stringify([cfg.lighting, fanCount]);
+    const firstGroup = store.status?.fan_groups[0];
+    const fanCount = firstGroup?.rpm.length ?? 3;
+    // 概览只展示第一组：有按组覆盖就展示那组，否则展示全局。
+    const override = firstGroup ? cfg.lighting.groups?.find((g) => g.address === firstGroup.address) : undefined;
+    const regions = override?.regions ?? cfg.lighting.fans;
+    const enabled = override?.enabled ?? cfg.lighting.enabled;
+    const key = JSON.stringify([regions, enabled, cfg.lighting.pump, fanCount]);
     if (key === previewKey) return;
     previewKey = key;
-    const l = cfg.lighting;
-    const fx = (scope: string) => l.fans.find((r) => r.effect.scope === scope) ?? l.fans[0];
+    const l: Lighting = { enabled, fans: regions, pump: cfg.lighting.pump, scenes: [], groups: [] };
+    const fx = (scope: string) => regions.find((r) => r.effect.scope === scope) ?? regions[0];
     const top = fx("Top"), bottom = fx("Bottom");
-    const fanText = top && bottom && top !== bottom && top.effect.mode !== bottom.effect.mode ? `上 ${modeName(top.effect.mode)} · 下 ${modeName(bottom.effect.mode)}` : modeName(l.fans[0]?.effect.mode ?? "Off");
-    lightText.textContent = l.enabled ? `风扇：${fanText} · 冷头：${modeName(l.pump.mode)}` : "未启用：设备保持现有灯光";
+    const fanText = top && bottom && top !== bottom && top.effect.mode !== bottom.effect.mode ? `上 ${modeName(top.effect.mode)} · 下 ${modeName(bottom.effect.mode)}` : modeName(regions[0]?.effect.mode ?? "Off");
+    lightText.textContent = enabled ? `风扇：${fanText} · 冷头：${modeName(l.pump.mode)}` : "未启用：设备保持现有灯光";
     try {
-      preview = l.enabled ? await previewFor(l, fanCount) : null;
+      preview = enabled ? await previewFor(l, fanCount) : null;
     } catch {
       preview = null;
     }
@@ -343,7 +350,10 @@ export function overview(): View {
             : cfg.cooling.fan_source === "gpu"
               ? "按 GPU 温度的自定义曲线"
               : "自定义曲线";
-    subtitle.textContent = store.offline ? "后台服务未连接" : [st?.last_error ? "有设备报错" : "所有设备在线", modeText && `按${modeText}控制`].filter(Boolean).join(" · ");
+    const ownGroups = cfg?.cooling.groups?.length ?? 0;
+    subtitle.textContent = store.offline
+      ? "后台服务未连接"
+      : [st?.last_error ? "有设备报错" : "所有设备在线", modeText && `按${modeText}控制`, ownGroups ? `${ownGroups} 组单独设置` : ""].filter(Boolean).join(" · ");
 
     const t = st?.coolant_c;
     countTo(gaugeValue, t, (v) => v.toFixed(1));
@@ -394,15 +404,28 @@ export function overview(): View {
 
     drawTimeline();
 
-    const g = st?.fan_groups[0];
-    dials.forEach((d, i) => {
-      d.el.hidden = !g || i >= g.rpm.length;
-      if (g && i < g.rpm.length) d.set((g.pwm[i] ?? 0) / 255, g.rpm[i], `${Math.round(((g.pwm[i] ?? 0) / 255) * 100)}%`);
-    });
+    const groups = st?.fan_groups ?? [];
+    // 保留已配置但暂时离线的组，不能让一组掉线后另一组变成“风扇1”。
+    const addresses = [...new Set([...(cfg?.cooling.groups ?? []).map((g) => g.address), ...groups.map((g) => g.address)])];
+    const labels = addresses.map((address) => cfg?.devices.aliases[address] || groups.find((g) => g.address === address)?.kind || address);
+    const layoutKey = JSON.stringify([addresses, labels]);
+    if (layoutKey !== dialLayoutKey) {
+      dialLayoutKey = layoutKey;
+      groupDials.clear();
+      addresses.forEach((address, i) => groupDials.set(address, dial(labels[i], "var(--c-fan)")));
+      dialList.replaceChildren(...[...groupDials.values()].map((d) => d.el), pumpDial.el);
+    }
+    for (const address of addresses) {
+      const g = groups.find((g) => g.address === address);
+      const d = groupDials.get(address)!;
+      const rpm = g?.rpm.length ? g.rpm.reduce((a, b) => a + b, 0) / g.rpm.length : null;
+      const duty = g?.pwm.length ? g.pwm.reduce((a, b) => a + b, 0) / g.pwm.length / 255 : null;
+      d.set(duty, rpm, g ? `组内 ${g.rpm.length} 只 · ${g.rpm.join(" / ")} rpm · ${Math.round((duty ?? 0) * 100)}%` : "离线 · 暂无转速读数");
+    }
     const maxPump = 3200;
     pumpDial.set(st?.pump_rpm != null ? st.pump_rpm / maxPump : null, st?.pump_rpm, st?.pump_target_rpm != null ? `目标 ${st.pump_target_rpm}` : "");
     const sub = root.querySelector("#dial-sub");
-    if (sub) sub.textContent = [g ? `${g.kind} ×${g.rpm.length}` : "没有绑定的无线风扇", "隐流二代泵"].join(" · ");
+    if (sub) sub.textContent = `${groups.length}/${addresses.length} 组在线 · ${rpms.length} 只风扇`;
 
     lcdBright.textContent = cfg ? `亮度 ${cfg.lcd.brightness}%` : "";
     refreshLighting();

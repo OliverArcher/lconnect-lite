@@ -59,6 +59,11 @@ pub struct RfDevice {
 }
 
 impl RfDevice {
+    /// Only the existing TL V2 wireless path is enabled for this build.
+    pub fn supports_fan_control(&self) -> bool {
+        self.dev_type == 0 && (1..=4).contains(&self.fan_count)
+            && self.fan_types.iter().take(usize::from(self.fan_count)).all(|t| matches!(t,27..=35))
+    }
     pub fn is_aio(&self) -> bool {
         matches!(self.dev_type, DEV_TYPE_H2_CIRCLE | DEV_TYPE_H2_SQUARE)
     }
@@ -137,6 +142,8 @@ pub struct Wireless {
     /// 按首次出现顺序保存的设备和最后一次出现的时间；slot 序号依赖这个顺序稳定。
     known: Vec<(RfDevice, Instant)>,
     last_frame: Option<([u8; 6], u8, Instant)>,
+    rx_diagnostic: String,
+    rx_trace: bool,
     dry_run: bool,
 }
 
@@ -158,6 +165,8 @@ impl Wireless {
             pages: 1,
             known: Vec::new(),
             last_frame: None,
+            rx_diagnostic: String::new(),
+            rx_trace: std::env::var_os("LCL_RX_TRACE").is_some(),
             dry_run,
         };
         w.discover_master()?;
@@ -210,9 +219,18 @@ impl Wireless {
             Duration::from_millis(100),
             Duration::from_millis(10),
         )?;
+        self.rx_diagnostic = describe_rx(&resp[..len], self.pages);
+        if self.rx_trace {
+            self.rx_diagnostic.push_str(&format!(" raw={}", hex(&resp[..len])));
+        }
         let fresh = parse_get_dev(&resp[..len], self.pages)?;
         self.pages = (resp[1].div_ceil(10)).clamp(1, 26);
         Ok(fresh)
+    }
+
+    /// 只含包长度和记录身份/类型，不含逐秒变化的转速；供回报缺失排查。
+    pub fn rx_diagnostic(&self) -> &str {
+        &self.rx_diagnostic
     }
 
     pub fn poll(&mut self) -> Result<Snapshot> {
@@ -465,6 +483,20 @@ impl Wireless {
         bail!("设备没有确认主板灯光同步的切换")
     }
 
+    /// Native Select (RF subcommand 0x12). Does not replace stored lighting or PWM.
+    /// Sending is not a visual acknowledgement: users must confirm the physical target.
+    pub fn identify(&mut self, dev: &RfDevice) -> Result<()> {
+        anyhow::ensure!(dev.master == self.master && dev.supports_fan_control(), "只能识别本机绑定的受支持TL风扇组");
+        let seq=if dev.cmd_seq>=254 {1} else {dev.cmd_seq+1};
+        let mut rf=rf_header(0x12,dev,&self.master,self.channel);
+        rf[17]=seq;
+        for _ in 0..10 {
+            self.send_rf(dev.traffic_channel(self.channel),dev.rx_type,&rf)?;
+            sleep(Duration::from_millis(30));
+        }
+        Ok(())
+    }
+
     /// 每秒一次的时钟广播。官方软件一直在发，设备靠它保持同步。
     pub fn send_clock(&mut self) -> Result<()> {
         let mut rf = vec![0u8; RF_DATA_SIZE];
@@ -585,6 +617,18 @@ fn constrain_pwm(dev: &RfDevice, mut pwm: [u8; 4]) -> [u8; 4] {
     pwm
 }
 
+fn describe_rx(resp: &[u8], pages: u8) -> String {
+    if resp.len() < 4 {
+        return format!("pages={pages} bytes={} header={}", resp.len(), hex(resp));
+    }
+    let records = resp[4..].chunks_exact(RECORD_LEN)
+        .take(usize::from(resp[1]).min(usize::from(pages) * 10))
+        .map(|r| format!("mac={} master={} ch={} rx={} type={} fans={} tail={:02x} accepted={}",
+            hex(&r[..6]), hex(&r[6..12]), r[12], r[13], r[18], r[19], r[41], parse_record(r).is_some()))
+        .collect::<Vec<_>>().join(" | ");
+    format!("pages={pages} bytes={} declared={} slots={} [{}]", resp.len(), resp[1], (resp.len()-4)/RECORD_LEN, records)
+}
+
 fn parse_get_dev(resp: &[u8], pages: u8) -> Result<Snapshot> {
     anyhow::ensure!(
         resp.len() >= 4 && resp[0] == USB_CMD_SEND_RF,
@@ -655,6 +699,31 @@ mod tests {
         r[24..28].fill(fan_type);
         r[41] = 0x1C;
         r
+    }
+
+    #[test]
+    fn rx_diagnostic_distinguishes_missing_and_rejected_records() {
+        assert!(describe_rx(&[], 1).contains("bytes=0"));
+        let mut reply = vec![0x10, 1, 0x80, 0];
+        reply.extend_from_slice(&record(0, 3, 27));
+        let accepted = describe_rx(&reply, 1);
+        assert!(accepted.contains("declared=1 slots=1"));
+        assert!(accepted.contains("fans=3 tail=1c accepted=true"));
+        *reply.last_mut().unwrap() = 0;
+        assert!(describe_rx(&reply, 1).contains("tail=00 accepted=false"));
+        assert!(describe_rx(&[0x10, 0, 0x80, 0], 1).contains("declared=0 slots=0"));
+    }
+
+    #[test]
+    fn only_known_tl_wireless_groups_are_writable() {
+        assert!(parse_record(&record(0,3,27)).unwrap().supports_fan_control());
+        assert!(parse_record(&record(0,1,35)).unwrap().supports_fan_control());
+        assert!(!parse_record(&record(0,0,27)).unwrap().supports_fan_control());
+        assert!(!parse_record(&record(65,3,27)).unwrap().supports_fan_control());
+        assert!(!parse_record(&record(0,3,51)).unwrap().supports_fan_control());
+        let dev=parse_record(&record(0,3,27)).unwrap();
+        let f=rf_header(0x12,&dev,&[9;6],8);
+        assert_eq!(f[0],0x12);assert_eq!(f[1],0x12);assert_eq!(&f[2..8],&dev.mac);
     }
 
     #[test]

@@ -1,21 +1,31 @@
-import { api, type EffectParams, type Lighting, type LightingCaps, type LightingPreview, type LightingScene, type Rgb, type RgbEffect, type RgbRegion } from "../api";
+import {
+  api,
+  type EffectParams,
+  type GroupLighting,
+  type Lighting,
+  type LightingCaps,
+  type LightingPreview,
+  type LightingScene,
+  type Rgb,
+  type RgbEffect,
+  type RgbRegion,
+} from "../api";
+import { deviceAlias } from "../device-actions";
 import { h, s } from "../dom";
 import { icon } from "../icons";
 import { animate, ledAt, LEDS_PER_FAN, PUMP_LEDS, previewFor } from "../lighting-preview";
 import { modeName } from "../modes";
 import { conceal, reveal } from "../motion";
+import { ring88Panel } from "./ring88";
 import { commit, store } from "../store";
 import { colorPicker, confirmDialog, promptDialog, segmented, toast, toggle } from "../ui";
 import type { View } from "./view";
 
 type ZoneId = "top" | "bottom" | "pump";
-const ZONES: ZoneId[] = ["top", "bottom", "pump"];
 const ZN: Record<ZoneId, string> = { top: "上灯带", bottom: "下灯带", pump: "冷头灯框" };
 const PALETTE: Rgb[] = [[242, 163, 58], [255, 90, 110], [255, 214, 10], [91, 224, 122], [74, 164, 255], [168, 107, 255], [244, 241, 234]];
 const SPEEDS = ["最慢", "慢", "中", "快", "最快"];
 const BRIGHTS = ["20%", "40%", "60%", "80%", "100%"];
-/** 拖颜色选择器时停手这么久才写入风扇。 */
-const SETTLE_MS = 350;
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const toHex = ([r, g, b]: Rgb) => `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
@@ -36,6 +46,8 @@ const BUILTIN: (LightingScene & { dot: string })[] = [
 /** 风扇的上、下灯带各取一个效果（“整体”时两边是同一个）。 */
 function fanZones(fans: RgbRegion[]): { top: RgbEffect; bottom: RgbEffect; flip: boolean } {
   const find = (scope: string) => fans.find((r) => r.effect.scope === scope) ?? fans.find((r) => r.effect.scope === "All") ?? fans[0];
+  const first = find("Top");
+  if (!first) return { top: effect("Off", []), bottom: effect("Off", []), flip: false };
   return { top: structuredClone(find("Top").effect), bottom: structuredClone(find("Bottom").effect), flip: fans.some((r) => r.flip) };
 }
 
@@ -49,29 +61,74 @@ function joinFans(top: RgbEffect, bottom: RgbEffect, flip: boolean): RgbRegion[]
   ];
 }
 
+type Selection = { kind: "group"; address: string } | { kind: "pump" };
+
 export function lighting(): View {
-  let caps: LightingCaps | null = null;
-  let draft: Lighting | null = store.config ? structuredClone(store.config.lighting) : null;
-  let sel: ZoneId[] = ["top", "bottom"];
+  /** 每个风扇组的灯效能力，按需拉取。 */
+  const capsByGroup = new Map<string, LightingCaps>();
+  let pumpParams: EffectParams[] | null = null;
+  let fanFallbackCount = 3;
+
+  let sel: Selection | null = null;
+  let autoPicked = false;
+  let zoneSel: ZoneId[] = ["top", "bottom"];
+  let fanDraft: { address: string; enabled: boolean; regions: RgbRegion[] } | null = null;
+  let pumpDraft: RgbEffect | null = null;
+  let pumpTouched = false;
   let slot = 0;
   let preview: LightingPreview | null = null;
   let previewKey = "";
-  let fanTimer = 0;
-  let fansPending = false;
-  /** 冷头灯框改过但还没发送。 */
-  let pumpTouched = false;
   let open = false;
   let active = -1;
 
-  const fanCount = () => Math.min(store.status?.fan_groups[0]?.rpm.length ?? caps?.fan_count ?? 3, 4) || 3;
-  const sent = () => store.config?.lighting;
-  const pumpDirty = () => draft != null && sent() != null && pumpTouched && !same(draft.pump, sent()!.pump);
-  const zoneEffect = (id: ZoneId): RgbEffect | null => {
-    if (!draft) return null;
-    if (id === "pump") return draft.pump;
-    return fanZones(draft.fans)[id];
+  const cfg = () => store.config;
+  const aliases = () => cfg()?.devices.aliases;
+  const entryOf = (address: string): GroupLighting | undefined => (cfg()?.lighting.groups ?? []).find((g) => g.address === address);
+
+  /** 界的组列表：本机绑定的风扇组 + 配置里已经存在但暂时离线的组。 */
+  function groupList(): { address: string; label: string; count: number }[] {
+    const seen = new Set<string>();
+    const out: { address: string; label: string; count: number }[] = [];
+    for (const g of store.status?.fan_groups ?? []) {
+      seen.add(g.address);
+      const alias = deviceAlias(g.address, aliases());
+      out.push({ address: g.address, label: alias || `${g.kind} ×${g.rpm.length || g.pwm.length}`, count: g.rpm.length || g.pwm.length });
+    }
+    for (const g of cfg()?.lighting.groups ?? []) {
+      if (seen.has(g.address)) continue;
+      const alias = deviceAlias(g.address, aliases());
+      out.push({ address: g.address, label: alias || `风扇组 ${g.address.slice(-5)}`, count: 0 });
+    }
+    return out;
+  }
+
+  const fanCountOf = (address: string | null): number => {
+    if (!address) return 1;
+    const g = store.status?.fan_groups.find((x) => x.address === address);
+    const n = g?.rpm.length || capsByGroup.get(address)?.fan_count || fanFallbackCount;
+    return Math.max(1, Math.min(4, n));
   };
-  const paramsOf = (id: ZoneId, mode: string): EffectParams | undefined => (id === "pump" ? caps?.pump : caps?.fans)?.find((p) => p.mode === mode);
+  const currentAddress = () => (sel?.kind === "group" ? sel.address : null);
+  const fanCount = () => fanCountOf(currentAddress());
+
+  const sentRegions = (address: string): RgbRegion[] => structuredClone(entryOf(address)?.regions ?? cfg()?.lighting.fans ?? []);
+  const sentEnabled = (address: string): boolean => entryOf(address)?.enabled ?? cfg()?.lighting.enabled ?? false;
+  const fansDirty = () => {
+    const a = currentAddress();
+    if (!a || !fanDraft) return false;
+    return fanDraft.enabled !== sentEnabled(a) || !same(fanDraft.regions, sentRegions(a));
+  };
+  const pumpDirty = () => !!pumpDraft && !!cfg() && pumpTouched && !same(pumpDraft, cfg()!.lighting.pump);
+
+  const zoneEffect = (id: ZoneId): RgbEffect | null => {
+    if (id === "pump") return pumpDraft;
+    if (!fanDraft) return null;
+    return fanZones(fanDraft.regions)[id];
+  };
+  const paramsOf = (id: ZoneId, mode: string): EffectParams | undefined => {
+    const list = id === "pump" ? pumpParams : capsFor(currentAddress())?.fans;
+    return list?.find((p) => p.mode === mode);
+  };
   const colorCount = (id: ZoneId, e: RgbEffect) => {
     const p = paramsOf(id, e.mode);
     if (!p || p.max_colors === 0) return 0;
@@ -87,100 +144,138 @@ export function lighting(): View {
     if (p.directions.length && !p.directions.includes(e.direction)) e.direction = p.directions[0];
   }
 
-  // ---------- 修改 ----------
-  /** 改选中的区域。风扇部分很快（约 1 秒的无线上传），直接写入；冷头灯框只改草稿，等“发送”。 */
-  function apply(label: string, mutate: (e: RgbEffect, id: ZoneId) => void, settle = false, bothStrips = false) {
-    if (!draft || !draft.enabled) return;
-    const z = fanZones(draft.fans);
-    const zones: Record<ZoneId, RgbEffect> = { top: z.top, bottom: z.bottom, pump: structuredClone(draft.pump) };
-    // 上下灯带共用一个帧间隔：速度改了哪条都要两条一起改。
-    const ids = bothStrips && sel.some((id) => id !== "pump") ? Array.from(new Set<ZoneId>([...sel, "top", "bottom"])) : sel;
-    for (const id of ids) {
-      mutate(zones[id], id);
-      fit(id, zones[id]);
-    }
-    draft.fans = joinFans(zones.top, zones.bottom, z.flip);
-    if (sel.includes("pump")) {
-      draft.pump = zones.pump;
-      pumpTouched = true;
-    }
-    redraw();
-    if (sel.some((id) => id !== "pump")) {
-      if (settle) {
-        fansPending = true;
-        clearTimeout(fanTimer);
-        fanTimer = window.setTimeout(() => commitFans(label), SETTLE_MS);
-      } else {
-        commitFans(label);
-      }
-    }
+  function capsFor(address: string | null): LightingCaps | undefined {
+    return address ? capsByGroup.get(address) : undefined;
   }
 
-  function commitFans(label: string) {
-    clearTimeout(fanTimer);
-    fansPending = false;
-    if (!draft || !store.config) return;
-    const next = structuredClone(store.config);
-    next.lighting.fans = structuredClone(draft.fans);
-    next.lighting.enabled = draft.enabled;
-    commit(next, `风扇${label}`, "light-fans");
+  /** 这台组当前能真正做到什么：只有后台明确 supports_control === true 才算可写。 */
+  function groupCap(address: string | null): "control" | "readonly" | "offline" {
+    if (!address) return "offline";
+    const g = store.status?.fan_groups.find((x) => x.address === address);
+    if (!g) return "offline";
+    return g.supports_control === true ? "control" : "readonly";
+  }
+
+  // ---------- 选择 ----------
+  function select(next: Selection) {
+    closeList();
+    sel = next;
+    zoneSel = next.kind === "pump" ? ["pump"] : ["top", "bottom"];
+    slot = 0;
+    loadDraft();
+    if (next.kind === "group" && !capsByGroup.has(next.address)) loadCaps(next.address);
+    redraw();
+  }
+
+  /** 把当前选择的草稿从配置里重新读一份（切换选择、撤销、离开再回来时）。 */
+  function loadDraft() {
+    if (!cfg()) return;
+    if (!sel) {
+      const first = groupList()[0];
+      sel = first ? { kind: "group", address: first.address } : { kind: "pump" };
+    }
+    if (sel.kind === "group") {
+      fanDraft = { address: sel.address, enabled: sentEnabled(sel.address), regions: sentRegions(sel.address) };
+      zoneSel = zoneSel.filter((z) => z !== "pump");
+      if (!zoneSel.length) zoneSel = ["top", "bottom"];
+    } else {
+      fanDraft = null;
+    }
+    // 冷头灯框有未发送的改动时保留草稿，别因为切组就丢掉。
+    if (!pumpTouched) pumpDraft = cfg() ? structuredClone(cfg()!.lighting.pump) : null;
+  }
+
+  // ---------- 修改（只改草稿，按“应用”才写配置） ----------
+  function apply(label: string, mutate: (e: RgbEffect, id: ZoneId) => void, bothStrips = false) {
+    if (sel?.kind === "pump") {
+      if (!pumpDraft) return;
+      mutate(pumpDraft, "pump");
+      fit("pump", pumpDraft);
+      pumpTouched = true;
+      redraw();
+      return;
+    }
+    if (!fanDraft) return;
+    if (!fanDraft.enabled) return;
+    if (groupCap(fanDraft.address) !== "control") return;
+    const z = fanZones(fanDraft.regions);
+    const zones: Record<"top" | "bottom", RgbEffect> = { top: z.top, bottom: z.bottom };
+    const ids = bothStrips ? (["top", "bottom"] as ZoneId[]) : zoneSel.filter((id) => id !== "pump");
+    for (const id of ids.length ? ids : (["top", "bottom"] as ZoneId[])) {
+      const key = id === "top" ? "top" : "bottom";
+      mutate(zones[key], key);
+      fit(key, zones[key]);
+    }
+    fanDraft.regions = joinFans(zones.top, zones.bottom, z.flip);
+    void label;
+    redraw();
+  }
+
+  function commitFans() {
+    if (!cfg() || !fanDraft) return Promise.resolve();
+    const next = structuredClone(cfg()!);
+    const entry: GroupLighting = { address: fanDraft.address, enabled: fanDraft.enabled, regions: structuredClone(fanDraft.regions) };
+    const groups = next.lighting.groups ?? [];
+    const i = groups.findIndex((g) => g.address === fanDraft!.address);
+    if (i >= 0) groups[i] = entry;
+    else groups.push(entry);
+    next.lighting.groups = groups;
+    return commit(next, `${groupLabel(fanDraft.address)} 的灯效`, `light-${fanDraft.address}`, ["lighting"]);
   }
 
   async function sendPump() {
-    if (!draft || !store.config) return;
-    const next = structuredClone(store.config);
-    next.lighting.pump = structuredClone(draft.pump);
+    if (!cfg() || !pumpDraft) return;
+    const next = structuredClone(cfg()!);
+    next.lighting.pump = structuredClone(pumpDraft);
     pumpTouched = false;
-    await commit(next, "冷头灯框（泵会短暂降速）", "light-pump");
+    await commit(next, "冷头灯框（泵会短暂降速）", "light-pump", ["lighting"]);
     redraw();
   }
 
   function revertPump() {
-    if (!draft || !sent()) return;
-    draft.pump = structuredClone(sent()!.pump);
+    if (!cfg()) return;
+    pumpDraft = structuredClone(cfg()!.lighting.pump);
     pumpTouched = false;
     redraw();
+  }
+
+  function groupLabel(address: string): string {
+    const g = groupList().find((x) => x.address === address);
+    return g?.label ?? (deviceAlias(address, aliases()) || `${address.slice(-5)} 风扇组`);
   }
 
   function applyScene(scene: LightingScene) {
-    if (!store.config) return;
-    const next = structuredClone(store.config);
-    next.lighting.enabled = true;
-    const flip = fanZones(next.lighting.fans).flip;
-    next.lighting.fans = scene.fans.map((r) => ({ ...structuredClone(r), flip }));
-    next.lighting.pump = structuredClone(scene.pump);
-    draft = structuredClone(next.lighting);
-    for (const id of ZONES) {
-      const e = zoneEffect(id);
-      if (e) fit(id, e);
+    if (!fanDraft) return;
+    if (groupCap(fanDraft.address) !== "control") {
+      toast("后台没有确认这台组支持灯效控制，现在只读", { error: true, key: "scene" });
+      return;
     }
-    pumpTouched = false;
+    const flip = fanZones(fanDraft.regions).flip;
+    fanDraft.regions = scene.fans.map((r) => ({ ...structuredClone(r), flip }));
+    fanDraft.enabled = true;
+    const z = fanZones(fanDraft.regions);
+    fit("top", z.top);
+    fit("bottom", z.bottom);
+    fanDraft.regions = joinFans(z.top, z.bottom, z.flip);
     redraw();
-    commit(next, `场景“${scene.name}”`, "light-scene");
+    toast(`已载入场景“${scene.name}”，点“应用”后生效`, { key: "scene" });
   }
 
   // ---------- 顶部 ----------
-  const enabledSwitch = toggle("由 LConnect Lite 控制灯光", (on) => {
-    if (!store.config || !draft) return;
-    draft.enabled = on;
-    const next = structuredClone(store.config);
-    next.lighting.enabled = on;
-    commit(next, on ? "开始控制灯光" : "停止控制灯光（设备保持现有灯光）", "light-enabled");
-    redraw();
-  });
+  const groupChips = h("div", { class: "group-chips" });
   const sceneRow = h("div", { style: "display: flex; flex-wrap: wrap; align-items: center; gap: 8px" });
   const saveScene = h("button", { type: "button", class: "chip", style: "border-style: dashed; color: var(--muted)" }, "+ 保存为场景");
   saveScene.addEventListener("click", async () => {
-    if (!store.config || !draft) return;
+    if (!cfg() || !fanDraft || !pumpDraft) return;
     const name = await promptDialog({ title: "保存当前灯效为场景", placeholder: "比如：游戏、看片", confirm: "保存" });
     if (!name) return;
-    const next = structuredClone(store.config);
-    next.lighting.scenes = [...(next.lighting.scenes ?? []).filter((x) => x.name !== name), { name, fans: structuredClone(draft.fans), pump: structuredClone(draft.pump) }];
-    commit(next, `保存场景“${name}”`, "light-scene");
+    const next = structuredClone(cfg()!);
+    next.lighting.scenes = [...(next.lighting.scenes ?? []).filter((x) => x.name !== name), { name, fans: structuredClone(fanDraft.regions), pump: structuredClone(pumpDraft) }];
+    commit(next, `保存场景“${name}”`, "light-scene", ["lighting"]);
   });
   let scenesKey = "";
   function drawScenes() {
-    const user = store.config?.lighting.scenes ?? [];
+    const user = cfg()?.lighting.scenes ?? [];
     const key = JSON.stringify(user.map((x) => x.name));
     if (key === scenesKey) return;
     scenesKey = key;
@@ -191,10 +286,10 @@ export function lighting(): View {
       b.title = "右键删除";
       b.addEventListener("contextmenu", async (e) => {
         e.preventDefault();
-        if (!(await confirmDialog({ title: `删除场景“${sc.name}”？`, body: "只删除这个保存的场景，不影响当前灯效。", confirm: "删除", danger: true })) || !store.config) return;
-        const next = structuredClone(store.config);
+        if (!(await confirmDialog({ title: `删除场景“${sc.name}”？`, body: "只删除这个保存的场景，不影响当前灯效。", confirm: "删除", danger: true })) || !cfg()) return;
+        const next = structuredClone(cfg()!);
         next.lighting.scenes = next.lighting.scenes.filter((x) => x.name !== sc.name);
-        commit(next, `删除场景“${sc.name}”`, "light-scene");
+        commit(next, `删除场景“${sc.name}”`, "light-scene", ["lighting"]);
       });
       return b;
     };
@@ -211,35 +306,11 @@ export function lighting(): View {
   }
 
   // ---------- 设备图 ----------
-  const chips = ZONES.map((id) => {
-    const fx = h("span", { class: "fx" });
-    const b = h("button", { type: "button", class: "zone-chip", "aria-pressed": "false" }, h("span", { class: "box" }), ZN[id], fx);
-    b.addEventListener("click", () => {
-      sel = sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id];
-      slot = 0;
-      closeList();
-      redraw();
-    });
-    return { b, fx };
-  });
-  const allBtn = h("button", { type: "button", class: "btn btn-sm btn-ghost", style: "margin-left: auto" }, "全选");
-  allBtn.addEventListener("click", () => {
-    sel = [...ZONES];
-    redraw();
-  });
-  const flipSwitch = toggle("风扇反装（上下翻转）", (on) => {
-    if (!draft || !draft.enabled) return;
-    const z = fanZones(draft.fans);
-    draft.fans = joinFans(z.top, z.bottom, on);
-    redraw();
-    commitFans(on ? "上下翻转" : "取消上下翻转");
-  });
-
   const stage = h("div", { class: "stage" });
   const stageInner = h("div", { class: "stage-inner" });
   stage.append(stageInner);
   let leds: { el: SVGElement; glow: SVGElement; kind: "fan" | "pump"; index: number }[] = [];
-  let outlineBoxes: Record<ZoneId, SVGRectElement> | null = null;
+  let outlineBoxes: { top: SVGRectElement; bottom: SVGRectElement; pump: SVGRectElement } | null = null;
   let builtFans = 0;
 
   function buildStage() {
@@ -299,7 +370,7 @@ export function lighting(): View {
     tracks.append(s("polyline", { points: line(frame) }));
     along(frame, PUMP_LEDS).forEach((p, i) => addLed(p, "pump", i));
     const fanW = n * 120 + 8;
-    const box = (x: number, y: number, w: number, hh: number) => s("rect", { class: "stage-outline", style: "opacity: 0", x, y, width: w, height: hh, rx: 8, fill:"var(--accent)", "fill-opacity": 0.07, stroke: "var(--accent)", "stroke-opacity": 0.7, "stroke-width": 1 });
+    const box = (x: number, y: number, w: number, hh: number) => s("rect", { class: "stage-outline", style: "opacity: 0", x, y, width: w, height: hh, rx: 8, fill: "var(--accent)", "fill-opacity": 0.07, stroke: "var(--accent)", "stroke-opacity": 0.7, "stroke-width": 1 });
     outlineBoxes = { top: box(12, 12, fanW, 30), bottom: box(12, 110, fanW, 30), pump: box(px - 6, 170, 132, 132) };
     const svg = s(
       "svg",
@@ -313,18 +384,26 @@ export function lighting(): View {
       tracks,
       glow,
       crisp,
-      s("text", { x: W / 2, y: 160, "text-anchor": "middle", fill: "var(--muted)", "font-size": 11 }, `UNI FAN TL 无线 ×${n}`),
+      s("text", { x: W / 2, y: 160, "text-anchor": "middle", fill: "var(--muted)", "font-size": 11 }, `UNI FAN ×${n}`),
       s("text", { x: W / 2, y: 322, "text-anchor": "middle", fill: "var(--muted)", "font-size": 11 }, "隐流二代 LCD-S"),
     );
     const pct = (v: number, of: number) => `${((v / of) * 100).toFixed(2)}%`;
     const hit = (id: ZoneId, x: number, y: number, w: number, hh: number) => {
       const b = h("button", { type: "button", class: "stage-hit", "aria-label": ZN[id], style: `left: ${pct(x, W)}; top: ${pct(y, H)}; width: ${pct(w, W)}; height: ${pct(hh, H)}` });
       b.addEventListener("click", (e) => {
+        if (id === "pump") {
+          select({ kind: "pump" });
+          return;
+        }
+        if (sel?.kind !== "group") {
+          const first = groupList()[0];
+          if (!first) return;
+          select({ kind: "group", address: first.address });
+        }
         const add = e.ctrlKey || e.metaKey || e.shiftKey;
-        if (add) sel = sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id];
-        else sel = [id];
+        if (add) zoneSel = zoneSel.includes(id) ? zoneSel.filter((x) => x !== id) : [...zoneSel, id];
+        else zoneSel = [id];
         slot = 0;
-        closeList();
         redraw();
       });
       return b;
@@ -346,13 +425,16 @@ export function lighting(): View {
 
   /** 预览：参数一变就重新渲染（缓存过的直接用）。 */
   function refreshPreview() {
-    if (!draft) return;
-    const n = fanCount();
-    const l = draft;
-    const key = JSON.stringify([l.fans, l.pump, n]);
+    if (!pumpDraft) return;
+    // 后端的预览接口只认 Lighting：把当前组的效果包进 fans，风扇数用这组的。
+    const regions = fanDraft?.regions ?? cfg()?.lighting.fans ?? [];
+    const enabled = fanDraft?.enabled ?? false;
+    const l: Lighting = { enabled, fans: regions, pump: pumpDraft, scenes: [], groups: [] };
+    const n = fanDraft ? fanCount() : fanFallbackCount;
+    const key = JSON.stringify([l.fans, l.pump, n, enabled]);
     if (key === previewKey) return;
     previewKey = key;
-    previewFor(l, n)
+    previewFor(l, enabled ? n : 0)
       .then((p) => {
         if (previewKey === key) preview = p;
       })
@@ -375,10 +457,10 @@ export function lighting(): View {
   const fxRow = h("div", { class: "irow" }, h("span", { class: "label" }, "效果"), h("div", { class: "control" }, h("div", { class: "dropdown" }, ddBtn, ddList), prevBtn, nextBtn));
 
   const slotsBox = h("div", { style: "display: flex; align-items: center; gap: 6px; width: 100%" });
-  const custom = colorPicker({ label: "自定义颜色", size: 22, onInput: (hex) => setSlotColor(fromHex(hex), true) });
+  const custom = colorPicker({ label: "自定义颜色", size: 22, onInput: (hex) => setSlotColor(fromHex(hex)) });
   const dots = PALETTE.map((c) => {
     const b = h("button", { type: "button", class: "color-dot", style: `background: ${toHex(c)}`, "aria-label": `颜色 ${toHex(c)}` });
-    b.addEventListener("click", () => setSlotColor(c, false));
+    b.addEventListener("click", () => setSlotColor(c));
     return b;
   });
   const colorRow = h(
@@ -388,7 +470,7 @@ export function lighting(): View {
     h("div", { class: "control", style: "flex-direction: column; align-items: flex-start; gap: 10px" }, slotsBox, h("div", { style: "display: flex; flex-wrap: wrap; gap: 6px" }, ...dots, custom.el)),
   );
 
-  const speedSeg = segmented(SPEEDS.map((n, i) => ({ value: i, label: n })), (v) => apply("速度", (e) => (e.speed = v), false, true), { label: "速度", small: true });
+  const speedSeg = segmented(SPEEDS.map((n, i) => ({ value: i, label: n })), (v) => apply("速度", (e) => (e.speed = v), true), { label: "速度", small: true });
   const brightSeg = segmented(BRIGHTS.map((n, i) => ({ value: i, label: n })), (v) => apply("亮度", (e) => (e.brightness = v)), { label: "亮度", small: true });
   const dirSeg = segmented(
     [
@@ -408,56 +490,72 @@ export function lighting(): View {
   const fanStatus = h("span", { class: "sync-line" }, h("span", { class: "dot dot-ok" }), h("span", {}));
   const pumpDot = h("span", { class: "dot dot-ok" });
   const pumpStatus = h("span", { class: "sync-line", style: "color: var(--text-2)" }, pumpDot, h("span", {}));
+  const applyBtn = h("button", { type: "button", class: "btn btn-primary", style: "flex: 2" }, "应用到这一组");
+  const discardBtn = h("button", { type: "button", class: "btn", style: "flex: 1" }, "放弃改动");
+  const fanActions = h("div", { style: "display: flex; gap: 8px" }, discardBtn, applyBtn);
   const revertBtn = h("button", { type: "button", class: "btn", style: "flex: 1" }, "还原");
   const sendBtn = h("button", { type: "button", class: "btn btn-primary", style: "flex: 2" }, "发送到冷头");
   const pumpActions = h("div", { style: "display: flex; gap: 8px" }, revertBtn, sendBtn);
-  // 这些块会随选择/状态显示或隐藏：出现时淡入一次（display 从 none 变回来才播放）。
-  for (const el of [editBox, emptyBox, colorRow, speedRow, dirRow, pumpActions]) el.classList.add("reveal");
+  for (const el of [editBox, emptyBox, colorRow, speedRow, dirRow, pumpActions, fanActions]) el.classList.add("reveal");
   revertBtn.addEventListener("click", revertPump);
   sendBtn.addEventListener("click", sendPump);
+  applyBtn.addEventListener("click", commitFans);
+  discardBtn.addEventListener("click", () => {
+    loadDraft();
+    redraw();
+  });
 
-  const root = h(
-    "div",
-    { class: "page" },
-    h(
-      "header",
-      { class: "page-head" },
-      h("div", { class: "page-title" }, h("h1", {}, "灯效"), h("span", { class: "subtitle" }, "点灯带选中，可以多选一起改")),
-      h("label", { class: "inline-switch", style: "min-height: 44px; color: var(--text-2)" }, "由 LConnect Lite 控制灯光", enabledSwitch),
-    ),
+  const enabledSwitch = toggle("这一组由 LConnect Lite 控制", (on) => {
+    if (!fanDraft) return;
+    if (groupCap(fanDraft.address) !== "control") return;
+    fanDraft.enabled = on;
+    redraw();
+  });
+
+  const ringPanel = ring88Panel();
+  let lightingTarget: "fans" | "ring" = "fans";
+  const ringChip = h("button", { type: "button", class: "chip", "aria-pressed": "false" }, icon("ring88"), "通用屏灯框");
+  const fanPanel = h("div", { class: "lighting-fan-panel" },
     sceneRow,
-    h(
-      "section",
-      { class: "row-grid", style: "align-items: stretch" },
-      h(
-        "div",
-        { class: "card stage-card" },
-        h("div", { style: "display: flex; flex-wrap: wrap; align-items: center; gap: 6px" }, ...chips.map((c) => c.b), allBtn),
+    h("section", { class: "row-grid", style: "align-items: stretch" },
+      h("div", { class: "card stage-card" },
+        h("div", { class: "card-head" }, h("span", { class: "small muted" }, "预览"), h("label", { class: "inline-switch small muted" }, enabledSwitch, "由 LConnect Lite 控制")),
         stage,
-        h("div", { class: "card-head" }, h("span", { class: "small", style: "color: var(--faint)" }, "Ctrl / Shift 点击可多选"), h("label", { class: "inline-switch small muted" }, "风扇反装（上下翻转）", flipSwitch)),
+        h("div", { class: "card-head" }, h("span", { class: "small", style: "color: var(--faint)" }, "点灯带或冷头切换编辑对象"), h("span", { class: "small muted" }, "组内转速由风扇页设置")),
       ),
-      h(
-        "aside",
-        { class: "card inspector", "aria-label": "编辑所选区域" },
-        h("div", { class: "inspector-head" }, title, sub),
-        emptyBox,
-        editBox,
-        h("div", { class: "sync-box", role: "status" }, fanStatus, pumpStatus, pumpActions),
+      h("aside", { class: "card inspector", "aria-label": "编辑所选区域" },
+        h("div", { class: "inspector-head" }, title, sub), emptyBox, editBox,
+        h("div", { class: "sync-box", role: "status" }, fanStatus, fanActions, pumpStatus, pumpActions),
       ),
     ),
   );
+  const root = h("div", { class: "page" },
+    h("header", { class: "page-head" }, h("div", { class: "page-title" }, h("h1", {}, "灯效"), h("span", { class: "subtitle" }, "配置风扇组、冷头灯框与通用屏灯框"))),
+    h("div", { class: "group-strip" }, groupChips),
+    fanPanel,
+    ringPanel.root,
+  );
+  const selectLightingTarget = (target: "fans" | "ring") => {
+    lightingTarget = target;
+    ringChip.setAttribute("aria-pressed", String(target === "ring"));
+    fanPanel.hidden = target !== "fans";
+    ringPanel.root.hidden = target !== "ring";
+    drawGroupChips();
+    if (target === "ring") ringPanel.update();
+  };
+  ringChip.addEventListener("click", () => selectLightingTarget("ring"));
+  ringPanel.root.hidden = true;
 
   // ---------- 效果下拉 ----------
   function modesForSelection(): string[] {
-    if (!caps) return [];
-    const lists = sel.map((id) => (id === "pump" ? caps!.pump : caps!.fans).map((p) => p.mode));
-    if (!lists.length) return [];
+    const list = sel?.kind === "pump" ? pumpParams : capsFor(currentAddress())?.fans;
+    if (!list) return [];
+    const modes = list.map((p) => p.mode);
     // “关闭”放到最后，不占列表最显眼的位置。
-    const modes = lists[0].filter((m) => lists.every((l) => l.includes(m)));
     return [...modes.filter((m) => m !== "Off"), ...modes.filter((m) => m === "Off")];
   }
   const commonValue = <T,>(f: (e: RgbEffect) => T): T | null => {
-    const vals = sel.map((id) => zoneEffect(id)).filter((e): e is RgbEffect => e != null).map(f);
+    const vals = zoneSel.map((id) => zoneEffect(id)).filter((e): e is RgbEffect => e != null).map(f);
     return vals.length && vals.every((v) => same(v, vals[0])) ? vals[0] : null;
   };
   const pickMode = (m: string) => {
@@ -471,9 +569,8 @@ export function lighting(): View {
     const modes = modesForSelection();
     const cur = commonValue((e) => e.mode);
     active = Math.max(0, modes.indexOf(cur ?? ""));
-    const hasPump = sel.includes("pump"), hasFan = sel.some((id) => id !== "pump");
     ddList.replaceChildren(
-      h("span", { class: "dropdown-note" }, hasFan && hasPump ? `含冷头灯框，只列两边都支持的 ${modes.length} 种` : hasPump ? `冷头灯框 · ${modes.length} 种` : `TL 风扇 · ${modes.length} 种`),
+      h("span", { class: "dropdown-note" }, `${sel?.kind === "pump" ? "冷头灯框" : "这组风扇"} · ${modes.length} 种效果`),
       ...modes.map((m, i) => {
         const b = h("button", { type: "button", role: "option", class: i === active ? "dropdown-item active" : "dropdown-item", "aria-selected": String(m === cur) }, h("span", { class: "check" }, m === cur ? "✓" : ""), modeName(m));
         b.addEventListener("click", () => pickMode(m));
@@ -521,39 +618,38 @@ export function lighting(): View {
   nextBtn.addEventListener("click", () => stepMode(1));
 
   // ---------- 颜色 ----------
-  // TL 的“静态”“呼吸”是每只风扇一种颜色。默认按“统一颜色”显示一个色块、改一次三只一起变；
-  // 只有主动切到“每只风扇”才显示带编号的三个色块。
+  // TL 的“静态”“呼吸”是每只风扇一种颜色。默认按“统一颜色”显示一个色块、改一次几只一起变；
+  // 只有主动切到“每只风扇”才显示带编号的色块。
   let split: boolean | null = null;
   let splitFor = "";
   const isPerFan = (id: ZoneId, e: RgbEffect) => id !== "pump" && !!paramsOf(id, e.mode)?.per_fan_colors;
-  const perFanZones = () => sel.filter((id) => {
+  const perFanZones = () => zoneSel.filter((id) => {
     const e = zoneEffect(id);
     return e != null && isPerFan(id, e);
   });
   function splitOn() {
-    const key = JSON.stringify(sel);
+    const key = JSON.stringify([sel?.kind, currentAddress(), zoneSel]);
     if (key !== splitFor) {
       splitFor = key;
       split = null;
     }
     return split ?? false;
   }
-  /** 统一模式下，三只风扇当前颜色其实不一样（比如 L-Connect 设的或之前分开设过）。 */
   const mixedFans = () => perFanZones().some((id) => new Set(zoneEffect(id)!.colors.map(toHex)).size > 1);
   function slotCount() {
     const s = splitOn();
-    return Math.max(0, ...sel.map((id) => {
+    return Math.max(0, ...zoneSel.map((id) => {
       const e = zoneEffect(id);
       if (!e) return 0;
       return isPerFan(id, e) && !s ? 1 : colorCount(id, e);
     }));
   }
-  function setSlotColor(c: Rgb, settle: boolean) {
+  function setSlotColor(c: Rgb) {
     const s = splitOn();
     apply("颜色", (e, id) => {
       if (isPerFan(id, e) && !s) e.colors = e.colors.map(() => c);
       else if (slot < colorCount(id, e)) e.colors[slot] = c;
-    }, settle);
+    });
   }
   const splitSeg = segmented(
     [
@@ -563,7 +659,7 @@ export function lighting(): View {
     (v) => {
       split = v === "each";
       slot = 0;
-      // 切回统一：三只都用第一个颜色。
+      // 切回统一：几只都用第一个颜色。
       if (!split) apply("统一颜色", (e, id) => {
         if (isPerFan(id, e)) e.colors = e.colors.map(() => e.colors[0]);
       });
@@ -577,7 +673,7 @@ export function lighting(): View {
     const s = splitOn();
     const n = slotCount();
     if (slot >= n) slot = 0;
-    const first = sel.map((id) => zoneEffect(id)).find((e) => e && e.colors.length) ?? null;
+    const first = zoneSel.map((id) => zoneEffect(id)).find((e) => e && e.colors.length) ?? null;
     const perFan = perFanZones().length > 0;
     splitSeg.el.hidden = !perFan;
     splitSeg.set(s ? "each" : "same");
@@ -603,13 +699,13 @@ export function lighting(): View {
         });
         return b;
       }),
-      ...(mixed ? [h("span", { class: "small", style: "color: var(--faint); line-height: 1.3" }, "三只现在颜色不同，选一个颜色会统一")] : []),
+      ...(mixed ? [h("span", { class: "small", style: "color: var(--faint); line-height: 1.3" }, "几只现在颜色不同，选一个颜色会统一")] : []),
     );
   }
 
   /** 下拉按钮里的预览条：风扇取各只的上灯带连成一条，冷头取整圈。 */
   function paintStrip(t: number) {
-    const id = sel[0];
+    const id = zoneSel[0];
     if (!id || !preview) return;
     const kids = strip.children;
     const n = id === "pump" ? PUMP_LEDS : fanCount() * 13;
@@ -621,37 +717,73 @@ export function lighting(): View {
   }
 
   // ---------- 绘制 ----------
+  function drawGroupChips() {
+    const list = groupList();
+    const items = list.map((g) => {
+      const b = h("button", { type: "button", class: "chip", "aria-pressed": String(lightingTarget === "fans" && sel?.kind === "group" && sel.address === g.address) }, icon("fan"), g.label, h("span", { class: "small muted" }, `×${g.count || 1}`));
+      b.addEventListener("click", () => {
+        selectLightingTarget("fans");
+        select({ kind: "group", address: g.address });
+      });
+      return b;
+    });
+    const pump = h("button", { type: "button", class: "chip", "aria-pressed": String(lightingTarget === "fans" && sel?.kind === "pump") }, icon("pump"), "冷头灯框");
+    pump.addEventListener("click", () => {
+      selectLightingTarget("fans");
+      select({ kind: "pump" });
+    });
+    ringChip.setAttribute("aria-pressed", String(lightingTarget === "ring"));
+    groupChips.replaceChildren(...(items.length ? items : [h("span", { class: "small muted" }, "没有找到本机绑定的风扇组")]), pump, ringChip);
+  }
+
   function redraw() {
-    if (!draft) return;
+    if (!cfg()) return;
+    if (!sel) loadDraft();
     if (builtFans !== fanCount()) buildStage();
-    enabledSwitch.checked = draft.enabled;
-    flipSwitch.checked = fanZones(draft.fans).flip;
-    flipSwitch.disabled = !draft.enabled;
-    stage.style.opacity = draft.enabled ? "" : "0.45";
-    for (const [i, id] of ZONES.entries()) {
-      chips[i].b.setAttribute("aria-pressed", String(sel.includes(id)));
-      const e = zoneEffect(id);
-      chips[i].fx.textContent = e ? modeName(e.disabled ? "Off" : e.mode) : "";
-      // 选中框淡入淡出（CSS 过渡），值没变时不重设。
-      if (outlineBoxes) {
-        const on = sel.includes(id) && draft.enabled ? "1" : "0";
-        if (outlineBoxes[id].style.opacity !== on) outlineBoxes[id].style.opacity = on;
-      }
-    }
+    drawGroupChips();
     drawScenes();
 
-    const editable = draft.enabled && sel.length > 0 && caps != null;
+    const pumpMode = sel?.kind === "pump";
+    enabledSwitch.parentElement!.hidden = pumpMode;
+    if (fanDraft) enabledSwitch.checked = fanDraft.enabled;
+    stage.style.opacity = fanDraft && !fanDraft.enabled && !pumpMode ? "0.45" : "";
+    for (const [id, box] of Object.entries(outlineBoxes ?? {})) {
+      const key = id as ZoneId;
+      const on = zoneSel.includes(key) && (key === "pump" || (fanDraft?.enabled ?? false));
+      box.style.opacity = on ? "1" : "0";
+    }
+
+    const cap = pumpMode ? "control" as const : groupCap(currentAddress());
+    const editable = pumpMode
+      ? !!pumpDraft
+      : !!fanDraft && fanDraft.enabled && cap === "control" && !!capsFor(currentAddress());
     editBox.hidden = !editable;
     emptyBox.hidden = editable;
-    emptyBox.textContent = !draft.enabled ? "灯光控制已关闭，设备保持现有灯光。打开右上角的开关后可以编辑。" : !caps ? "正在读取灯效能力…" : "点左边的灯带或冷头";
-    title.textContent = sel.length ? sel.map((id) => ZN[id]).join(" + ") : "编辑";
-    sub.textContent = sel.length > 1 ? `改动会同时作用到这 ${sel.length} 个区域` : sel.length ? "改动只作用到这个区域" : "没有选中区域";
+    emptyBox.textContent = pumpMode
+      ? "正在读取冷头灯效能力…"
+      : !fanDraft
+        ? "没有可以编辑的风扇组"
+        : cap === "offline"
+          ? "这台组现在不在线，灯效只能查看，不能应用。"
+          : cap === "readonly"
+            ? "后台没有确认这台组支持单独的灯效控制（旧版后台或未验证的系列），这里只读。"
+            : !fanDraft.enabled
+              ? "这一组已关闭灯光控制，设备保持现有灯光。打开右上角的开关后可以编辑。"
+              : "正在读取这组的灯效能力…";
+
+    title.textContent = pumpMode ? ZN.pump : fanDraft ? groupLabel(fanDraft.address) : "编辑";
+    sub.textContent = pumpMode
+      ? "改动要单独发送，发送时泵会短暂降速"
+      : cap === "control"
+        ? "改动只作用于这一组，点“应用”后生效"
+        : "只读：没有确认这台组支持灯效控制";
+    enabledSwitch.disabled = !pumpMode && cap !== "control";
 
     if (editable) {
       const mode = commonValue((e) => e.mode);
-      const modes = Array.from(new Set(sel.map((id) => modeName(zoneEffect(id)!.mode))));
+      const modes = Array.from(new Set(zoneSel.map((id) => modeName(zoneEffect(id)!.mode))));
       fxName.textContent = mode ? modeName(mode) : `混合（${modes.join("、")}）`;
-      const ps = sel.map((id) => paramsOf(id, zoneEffect(id)!.mode));
+      const ps = zoneSel.map((id) => paramsOf(id, zoneEffect(id)!.mode));
       colorRow.hidden = slotCount() === 0;
       drawSlots();
       speedRow.hidden = !ps.some((p) => p?.supports_speed);
@@ -659,67 +791,116 @@ export function lighting(): View {
       brightSeg.set(commonValue((e) => e.brightness));
       dirRow.hidden = !ps.every((p) => p && p.directions.length > 1);
       dirSeg.set(commonValue((e) => e.direction));
-      note.textContent = sel.some((id) => id !== "pump") && !speedRow.hidden ? "上下灯带共用一个速度（同一个无线设备）" : "";
+      note.textContent = !pumpMode && !speedRow.hidden ? "上下灯带共用一个速度（同一个无线设备）" : "";
     }
 
-    const fanSpan = fanStatus.lastElementChild!;
-    fanSpan.textContent = fansPending ? "风扇：正在应用…" : !draft.enabled ? "灯光：未控制" : "风扇：改动实时生效";
+    const fansNow = fansDirty();
+    fanStatus.firstElementChild!.className = fansNow ? "dot dot-warn" : "dot dot-ok";
+    fanStatus.lastElementChild!.textContent = pumpMode
+      ? "风扇：这组不适用"
+      : cap !== "control"
+        ? "风扇：只读（未确认支持）"
+        : fansNow
+          ? "风扇：有改动未应用"
+          : "风扇：已应用";
+    fanStatus.hidden = pumpMode;
+    fanActions.hidden = !fansNow || pumpMode || cap !== "control";
+    applyBtn.disabled = cap !== "control";
+
     const dirty = pumpDirty();
     pumpDot.className = dirty ? "dot dot-warn" : "dot dot-ok";
     pumpStatus.lastElementChild!.textContent = dirty ? "冷头灯框有改动未发送（发送时泵会降速约 7 秒）" : "冷头灯框：已同步";
-    pumpActions.hidden = !dirty;
+    pumpActions.hidden = !dirty || !pumpMode;
     refreshPreview();
   }
 
-  async function loadCaps() {
+  async function loadCaps(address: string) {
     try {
-      caps = await api.getLightingCaps();
-      if (draft) for (const id of ZONES) fitZone(id);
+      const caps = await api.getGroupLightingCaps(address);
+      capsByGroup.set(address, caps);
+      fanFallbackCount = caps.fan_count || fanFallbackCount;
+      if (fanDraft?.address === address && groupCap(address) === "control") {
+        const z = fanZones(fanDraft.regions);
+        fit("top", z.top);
+        fit("bottom", z.bottom);
+        fanDraft.regions = joinFans(z.top, z.bottom, z.flip);
+      }
+      redraw();
+    } catch (e) {
+      // 老版本后台没有这个命令：退回全局能力，灯效仍可编辑。
+      try {
+        const caps = await api.getLightingCaps();
+        capsByGroup.set(address, caps);
+        pumpParams ??= caps.pump;
+        redraw();
+      } catch {
+        toast(`读取这组灯效能力失败：${e}`, { error: true, key: "caps" });
+      }
+    }
+  }
+
+  async function loadPumpCaps() {
+    if (pumpParams) return;
+    try {
+      const caps = await api.getLightingCaps();
+      pumpParams = caps.pump;
+      fanFallbackCount = caps.fan_count || fanFallbackCount;
       redraw();
     } catch (e) {
       toast(`读取灯效能力失败：${e}`, { error: true, key: "caps" });
     }
   }
-  /** 配置里的颜色数可能和效果要求不符（比如手改过配置文件）：显示前先修正，不写回。 */
-  function fitZone(id: ZoneId) {
-    if (!draft) return;
-    if (id === "pump") return fit(id, draft.pump);
-    const z = fanZones(draft.fans);
-    fit("top", z.top);
-    fit("bottom", z.bottom);
-    draft.fans = joinFans(z.top, z.bottom, z.flip);
-  }
 
   function update() {
-    const cfg = store.config?.lighting;
-    if (cfg && draft && !fansPending) {
-      // 撤销、托盘或别处改了配置：风扇跟着后台；冷头灯框没动过才跟着。
-      if (!same(cfg.fans, draft.fans) || cfg.enabled !== draft.enabled) {
-        draft.fans = structuredClone(cfg.fans);
-        draft.enabled = cfg.enabled;
-      }
-      if (!pumpTouched && !same(cfg.pump, draft.pump)) draft.pump = structuredClone(cfg.pump);
-    } else if (cfg && !draft) {
-      draft = structuredClone(cfg);
+    ringPanel.update();
+    if (!cfg()) return;
+    // 配置第一次到达（或者本机后来才绑定上风扇组）：默认选第一组，而不是停在冷头上。
+    if (!autoPicked) {
+      autoPicked = true;
+      const first = groupList()[0];
+      if (first) sel = { kind: "group", address: first.address };
+      loadDraft();
     }
-    if (!caps && !store.offline) loadCaps();
+    // 没改过就跟着后台走（撤销、导入、改名、在别的页面改了全局效果）。
+    if (!sel || (!fansDirty() && !pumpDirty())) loadDraft();
+    if (sel?.kind === "group" && !capsByGroup.has(sel.address)) void loadCaps(sel.address);
+    void loadPumpCaps();
     redraw();
   }
 
-  if (draft) redraw();
+  loadDraft();
+  const firstGroup = groupList()[0];
+  if (!sel) sel = firstGroup ? { kind: "group", address: firstGroup.address } : { kind: "pump" };
+  loadDraft();
+  // 已经有组就不用 update 里再自选一次（避免把这一秒里的改动冲掉）。
+  autoPicked = sel?.kind === "group";
+  if (sel.kind === "group") void loadCaps(sel.address);
+  void loadPumpCaps();
+  redraw();
+
   return {
     root,
     update,
     dispose() {
       stopAnim();
+      ringPanel.dispose?.();
       document.removeEventListener("click", onDocClick);
-      if (fansPending) commitFans("颜色");
     },
     async beforeLeave() {
-      if (!pumpDirty()) return true;
-      const send = await confirmDialog({ title: "冷头灯框的改动还没发送", body: "发送时泵会短暂回到默认转速（约 7 秒）。不发送的话，冷头灯框保持原来的效果。", confirm: "发送并离开", cancel: "不发送" });
-      if (send) await sendPump();
-      else revertPump();
+      if (pumpDirty()) {
+        const send = await confirmDialog({ title: "冷头灯框的改动还没发送", body: "发送时泵会短暂回到默认转速（约 7 秒）。不发送的话，冷头灯框保持原来的效果。", confirm: "发送并离开", cancel: "不发送" });
+        if (send) await sendPump();
+        else revertPump();
+      }
+      if (fansDirty()) {
+        if (groupCap(currentAddress()) !== "control") {
+          loadDraft();
+        } else {
+          const keep = await confirmDialog({ title: "风扇灯效还有没应用的改动", body: "离开前应用吗？不应用则丢弃这次改动。", confirm: "应用并离开", cancel: "丢弃改动" });
+          if (keep) await commitFans();
+          else loadDraft();
+        }
+      }
       return true;
     },
   };

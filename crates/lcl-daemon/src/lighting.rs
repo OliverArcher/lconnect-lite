@@ -21,30 +21,34 @@ pub struct LightingCtl {
     uploads: HashMap<[u8; 6], (String, RgbUpload)>,
     /// 每个风扇组：(上次上传时间, 连续未生效次数)。
     attempts: HashMap<[u8; 6], (Instant, u32)>,
+    suspended: HashMap<[u8;6],Instant>,
     pump_applied: Option<String>,
     pump_attempt: Option<Instant>,
 }
 
 /// TL V2 风扇（LED / LCD 版），渲染器按这种布局（每风扇 26 颗）出帧。
 fn is_tl(dev: &RfDevice) -> bool {
-    dev.fan_types.iter().take(usize::from(dev.fan_count)).all(|t| matches!(t, 27..=35))
+    dev.supports_fan_control()
 }
 
 impl LightingCtl {
+    pub fn suspend(&mut self,address:[u8;6],duration:Duration) { self.suspended.insert(address,Instant::now()+duration); }
     /// 无线风扇组：发现不一致就上传。返回需要报告的错误。
     pub fn drive_fans(&mut self, cfg: &Lighting, wl: &mut Wireless, snap: &Snapshot, errors: &mut Vec<String>) {
-        if !cfg.enabled {
-            return;
-        }
-        let groups: Vec<RfDevice> = wl.own_devices(snap).into_iter().filter(|(_, d)| !d.is_aio()).map(|(_, d)| d.clone()).collect();
+        let groups: Vec<RfDevice> = wl.own_devices(snap).into_iter().filter(|(_, d)| d.supports_fan_control()).map(|(_, d)| d.clone()).collect();
         for dev in groups {
+            if self.suspended.get(&dev.mac).is_some_and(|until|Instant::now()<*until) {continue;}
+            let group=cfg.groups.iter().find(|g|g.address.eq_ignore_ascii_case(&dev.mac_str()));
+            let enabled=group.map_or(cfg.enabled,|g|g.enabled);
+            if !enabled {continue;}
+            let regions=group.map_or(cfg.fans.as_slice(),|g|g.regions.as_slice());
             if !is_tl(&dev) {
                 errors.push(format!("{}：暂只支持 TL 无线风扇的灯效", dev.kind()));
                 continue;
             }
-            let key = format!("{:?}/{}", cfg.fans, dev.fan_count);
+            let key = format!("{:?}/{}", regions, dev.fan_count);
             if self.uploads.get(&dev.mac).is_none_or(|(k, _)| *k != key) {
-                let built = lcl_effects::tl::render(&cfg.fans, usize::from(dev.fan_count))
+                let built = lcl_effects::tl::render(regions, usize::from(dev.fan_count))
                     .and_then(|a| RgbUpload::new(&a.frames, a.interval_hundredths));
                 match built {
                     Ok(up) => {

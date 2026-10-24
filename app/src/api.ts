@@ -3,10 +3,24 @@ import { mockApi } from "./mock";
 
 // 与 crates/lcl-core 的 Status / Config 一一对应。
 export type Mode = "fixed" | "curve" | "motherboard";
+/** 全局风扇曲线的温度源（保留下来的旧字段）。 */
 export type TempSource = "coolant" | "gpu";
+/** 单组曲线可选的采样源：水温 / GPU / CPU 封装温度。 */
+export type GroupSource = TempSource | "cpu";
 export type Point = [number, number];
 
-export interface FanGroup { address: string; kind: string; rpm: number[]; pwm: number[] }
+export interface FanGroup {
+  address: string;
+  kind: string;
+  rpm: number[];
+  pwm: number[];
+  /** 后台服务这一轮算出的目标占空比（%）；没有读数或不受控时为空。 */
+  target_percent?: number | null;
+  /** 这台组的采样源当前读不到数据的原因。 */
+  source_error?: string | null;
+  /** 这台组能否单独调速；不支持的组（未验证的系列、别的主机）界面上只读。 */
+  supports_control?: boolean;
+}
 export interface WirelessDevice {
   address: string;
   kind: string;
@@ -22,6 +36,8 @@ export interface DeviceInfo { name: string; connection: string; address: string 
 
 export interface Status {
   uptime_s: number;
+  /** 8.8 灯环；没有这块硬件时为空。 */
+  ring88?: Ring88Status | null;
   mode: Mode | null;
   /** 低通滤波后的水温，曲线用的就是它。 */
   coolant_c: number | null;
@@ -75,7 +91,36 @@ export interface Cooling {
   pump_power_boost_rpm: number;
   /** CPU 温度保护上限（°C）；0 关闭。 */
   cpu_temp_limit_c: number;
+  /** 旧版单风扇覆盖；界面已不再提供入口，只为读写旧配置保留。 */
   fan_overrides: FanOverride[];
+  /** 每个无线风扇组一条独立策略（组内转速仍然统一）。 */
+  groups: FanGroupPolicy[];
+}
+
+/**
+ * 一组风扇的独立策略。组内所有风扇共用一个目标值，`address` 是组的无线地址（MAC）。
+ * 没有对应条目的组沿用全局字段（`Cooling.mode` / `fan_curve` / `fixed_fan_percent`）。
+ */
+export interface FanGroupPolicy {
+  address: string;
+  mode: Mode;
+  fixed_percent: number;
+  source: GroupSource;
+  curve: { points: Point[] };
+  /** 采样间隔（毫秒）。 */
+  sample_interval_ms: number;
+  /** 读数的低通时间常数（毫秒），0 不平滑。 */
+  smoothing_ms: number;
+  /** 温度回差（°C），避免在拐点附近来回跳。 */
+  hysteresis_c: number;
+  /** 温度掉下来后等多久才降速（秒）。 */
+  fall_delay_s: number;
+  /** 升速限幅（%/秒）。 */
+  slew_up_percent_per_s: number;
+  /** 降速限幅（%/秒）。 */
+  slew_down_percent_per_s: number;
+  /** 读不到采样源时用的安全占空比（%）。 */
+  fallback_percent: number;
 }
 
 /** 与 lcl-effects 的 RgbMode 变体名一致。 */
@@ -102,10 +147,20 @@ export interface LightingScene { name: string; fans: RgbRegion[]; pump: RgbEffec
 
 export interface Lighting {
   enabled: boolean;
+  /** 全局风扇效果：没有被 `groups` 覆盖的组沿用这一份。 */
   fans: RgbRegion[];
   pump: RgbEffect;
   /** 用户保存的场景（后台服务不读）。 */
   scenes: LightingScene[];
+  /** 按组覆盖的风扇效果。 */
+  groups: GroupLighting[];
+}
+
+/** 一个无线风扇组的灯效；`regions` 的语义和全局 `fans` 一样（整体 / 上灯带 + 下灯带）。 */
+export interface GroupLighting {
+  address: string;
+  enabled: boolean;
+  regions: RgbRegion[];
 }
 
 export interface EffectParams {
@@ -146,7 +201,38 @@ export interface ThemeMeta { id: string; name: string; tier: "flat" | "medium" |
 
 export interface LcdState { description: string; error: string | null; preview_jpeg_base64: string | null }
 
-export interface Config { cooling: Cooling; lighting: Lighting; lcd: Lcd; devices: { locked: string[] } }
+/** 8.8 寸屏的灯环（实验性，协议尚未在硬件上验证）。 */
+export interface Ring88 {
+  enabled: boolean;
+  effect: RgbEffect;
+}
+
+/** 8.8 灯环的运行状态；`external_display` 表示屏幕画面由外部程序（Libre Panel）在驱动。 */
+export interface Ring88Status {
+  /** 0416:8050 enumerated without claiming it. */
+  present: boolean;
+  /** LED interface is opened for control. */
+  connected: boolean;
+  /** 1CBE:A088 read-only display interface; content still belongs to LP. */
+  display_present: boolean;
+  error: string | null;
+  external_display: boolean;
+}
+
+export interface Config {
+  /** 配置结构版本；后台服务按它做迁移。 */
+  schema_version: number;
+  cooling: Cooling;
+  lighting: Lighting;
+  lcd: Lcd;
+  devices: {
+    locked: string[];
+    channel?: number | null;
+    /** 设备地址（MAC）→ 用户起的名字。 */
+    aliases: Record<string, string>;
+  };
+  ring88: Ring88;
+}
 
 export interface Api {
   getStatus(): Promise<Status>;
@@ -165,6 +251,12 @@ export interface Api {
   themePreview(id: string, dark: boolean, accent: Rgb | null, size: number): Promise<string | null>;
   bind(address: string): Promise<void>;
   unbind(address: string): Promise<void>;
+  /** 让设备闪灯 / 报位置，用来对应界面上的名字。 */
+  identify(address: string): Promise<void>;
+  /** 给设备起一个本机名字（写入配置，不向设备发送）。 */
+  renameDevice(address: string, name: string): Promise<void>;
+  /** 某个风扇组的灯效能力（效果清单按这组的系列和风扇数算）。 */
+  getGroupLightingCaps(address: string): Promise<LightingCaps>;
   setMbLightSync(address: string, enabled: boolean): Promise<void>;
   /** 把本机发射器和已绑定设备切到另一个频道；有设备没跟上会自动切回并报错。 */
   setChannel(channel: number): Promise<void>;
@@ -206,6 +298,9 @@ export const api: Api = isMock
       },
       bind: (address) => invoke<void>("bind_device", { address }),
       unbind: (address) => invoke<void>("unbind_device", { address }),
+      identify: (address) => invoke<void>("identify_device", { address }),
+      renameDevice: (address, name) => invoke<void>("rename_device", { address, name }),
+      getGroupLightingCaps: (address) => invoke<LightingCaps>("get_group_lighting_caps", { address }),
       setMbLightSync: (address, enabled) => invoke<void>("set_mb_light_sync", { address, enabled }),
       setChannel: (channel) => invoke<void>("set_channel", { channel }),
       pickMedia: (kind) => invoke<string | null>("pick_media", { kind }),

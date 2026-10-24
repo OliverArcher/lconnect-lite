@@ -1,0 +1,20 @@
+[package]
+name = "lcl-display-host"
+description = "H2 屏幕内容宿主：渲染画面交给后台服务推屏，自己不碰 USB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+lcl-core.workspace = true
+lcl-media = { path = "../lcl-media" }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png"] }

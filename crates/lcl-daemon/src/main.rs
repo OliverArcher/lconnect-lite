@@ -6,6 +6,7 @@ mod cpu;
 mod h2slot;
 mod lcd;
 mod lighting;
+mod ring_service;
 mod log;
 mod probe;
 mod service;

@@ -217,11 +217,17 @@ export function promptDialog(opts: { title: string; placeholder?: string; confir
       if (e.key === "Escape") close(null);
     };
     cancel.addEventListener("click", () => close(null));
-    dialog.addEventListener("submit", (e) => {
-      e.preventDefault();
+    // Do not rely on implicit form-submit behavior in WebView2. The Save action
+    // is an explicit button, and Enter in the field calls the same handler.
+    const submit = () => {
       const v = input.value.trim();
       if (v) close(v);
+    };
+    ok.addEventListener("click", submit);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); submit(); }
     });
+    dialog.addEventListener("submit", (e) => { e.preventDefault(); submit(); });
     backdrop.addEventListener("click", (e) => e.target === backdrop && close(null));
     document.addEventListener("keydown", onKey, true);
     document.body.append(backdrop);
